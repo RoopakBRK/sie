@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -423,7 +424,8 @@ def test_generate_collect_into_result(mock_async_client: MagicMock, adapter) -> 
         'data: {"text": "abcdef", "meta_info": {"prompt_tokens": 1, "completion_tokens": 2, "finish_reason": {"type": "length"}}}',
     ]
     stream = _FakeStreamingResponse(sse_lines)
-    mock_async_client.return_value = _make_client_with_stream(stream)
+    client_instance = _make_client_with_stream(stream)
+    mock_async_client.return_value = client_instance
     adapter._server_url = "http://localhost:30005"
 
     result = asyncio.run(
@@ -433,6 +435,34 @@ def test_generate_collect_into_result(mock_async_client: MagicMock, adapter) -> 
     assert result.finish_reason == "length"
     assert result.prompt_tokens == 1
     assert result.completion_tokens == 2
+    client_instance.post.assert_not_awaited()
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_queue_child_task_wrapper_close_does_not_abort_terminal_request(
+    mock_async_client: MagicMock,
+    adapter,
+) -> None:
+    stream = _FakeStreamingResponse(
+        [
+            'data: {"text": "done", "meta_info": {"prompt_tokens": 1, "completion_tokens": 1, "finish_reason": {"type": "stop"}}}',
+        ]
+    )
+    client_instance = _make_client_with_stream(stream)
+    mock_async_client.return_value = client_instance
+    adapter._server_url = "http://localhost:30005"
+
+    async def _run() -> None:
+        chunks = suppress_thinking_blocks(adapter.generate(prompt="Hi", max_new_tokens=8))
+        while True:
+            chunk = await asyncio.create_task(anext(chunks))
+            if chunk.done:
+                break
+        await chunks.aclose()
+
+    asyncio.run(_run())
+
+    client_instance.post.assert_not_awaited()
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
@@ -707,6 +737,100 @@ def test_generate_streaming_n_gt_one_fans_out_choice_index(mock_async_client: Ma
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_streaming_n_gt_one_aclose_aborts_incomplete_request(
+    mock_async_client: MagicMock,
+    adapter,
+) -> None:
+    class _NeverEnding(_FakeStreamingResponse):
+        async def aiter_lines(self):
+            yield 'data: {"index": 0, "text": "first", "meta_info": {"prompt_tokens": 1}}'
+            await asyncio.Event().wait()  # pragma: no cover - closed by the test
+
+    client_instance = _make_client_with_stream(_NeverEnding(lines=[]))
+    mock_async_client.return_value = client_instance
+    adapter._server_url = "http://localhost:30005"
+
+    async def _run() -> None:
+        chunks = adapter.generate(prompt="Hi", max_new_tokens=8, n=2, stream=True)
+        first = await anext(chunks)
+        assert first.text_delta == "first"
+        await chunks.aclose()
+        if adapter._abort_tasks:
+            await asyncio.gather(*tuple(adapter._abort_tasks))
+
+    asyncio.run(_run())
+
+    request_rid = client_instance.stream.call_args.kwargs["json"]["rid"]
+    client_instance.post.assert_awaited_once()
+    args, kwargs = client_instance.post.await_args
+    assert args[0].endswith("/abort_request")
+    assert kwargs["json"] == {"rid": request_rid}
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_streaming_n_gt_one_cancellation_aborts_incomplete_request(
+    mock_async_client: MagicMock,
+    adapter,
+) -> None:
+    class _NeverEnding(_FakeStreamingResponse):
+        async def aiter_lines(self):
+            yield 'data: {"index": 0, "text": "first", "meta_info": {"prompt_tokens": 1}}'
+            await asyncio.Event().wait()  # pragma: no cover - cancelled by the test
+
+    client_instance = _make_client_with_stream(_NeverEnding(lines=[]))
+    mock_async_client.return_value = client_instance
+    adapter._server_url = "http://localhost:30005"
+
+    async def _run() -> None:
+        chunks = adapter.generate(prompt="Hi", max_new_tokens=8, n=2, stream=True)
+        assert (await anext(chunks)).text_delta == "first"
+        pending = asyncio.create_task(anext(chunks))
+        await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        if adapter._abort_tasks:
+            await asyncio.gather(*tuple(adapter._abort_tasks))
+
+    asyncio.run(_run())
+
+    request_rid = client_instance.stream.call_args.kwargs["json"]["rid"]
+    client_instance.post.assert_awaited_once()
+    args, kwargs = client_instance.post.await_args
+    assert args[0].endswith("/abort_request")
+    assert kwargs["json"] == {"rid": request_rid}
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_streaming_n_gt_one_terminal_close_does_not_abort(
+    mock_async_client: MagicMock,
+    adapter,
+) -> None:
+    stream = _FakeStreamingResponse(
+        [
+            'data: {"index": 0, "text": "A", "meta_info": {"prompt_tokens": 1, "completion_tokens": 1, "finish_reason": {"type": "stop"}}}',
+            'data: {"index": 1, "text": "B", "meta_info": {"prompt_tokens": 1, "completion_tokens": 1, "finish_reason": {"type": "stop"}}}',
+            "data: [DONE]",
+        ]
+    )
+    client_instance = _make_client_with_stream(stream)
+    mock_async_client.return_value = client_instance
+    adapter._server_url = "http://localhost:30005"
+
+    async def _run() -> None:
+        chunks = adapter.generate(prompt="Hi", max_new_tokens=8, n=2, stream=True)
+        while not (await anext(chunks)).done:
+            pass
+        await chunks.aclose()
+        if adapter._abort_tasks:
+            await asyncio.gather(*tuple(adapter._abort_tasks))
+
+    asyncio.run(_run())
+
+    client_instance.post.assert_not_awaited()
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
 def test_generate_request_body_uses_stream_true(mock_async_client: MagicMock, adapter) -> None:
     sse_lines = [
         'data: {"text": "x", "meta_info": {"prompt_tokens": 1, "completion_tokens": 1, "finish_reason": {"type": "stop"}}}',
@@ -915,6 +1039,112 @@ def test_generate_explicit_min_new_tokens_overrides_profile_default_when_valid(
     assert sampling_params["min_new_tokens"] == 2
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(GrammarSpec(kind="json_schema", value={"type": "string"}), id="json_schema"),
+        pytest.param(GrammarSpec(kind="regex", value="[a-z]+"), id="regex"),
+        pytest.param(GrammarSpec(kind="ebnf", value='root ::= "ok"'), id="ebnf"),
+    ]
+)
+def grammar_default_sampling_spec(request: pytest.FixtureRequest) -> GrammarSpec:
+    return request.param
+
+
+@pytest.mark.parametrize(
+    ("min_new_tokens", "top_k", "repetition_penalty"),
+    [
+        pytest.param(None, None, None, id="inherited"),
+        pytest.param(0, None, None, id="explicit-zero"),
+        pytest.param(2, 5, 1.2, id="explicit-overrides"),
+    ],
+)
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_grammar_default_sampling(
+    mock_async_client: MagicMock,
+    grammar_default_sampling_spec: GrammarSpec,
+    min_new_tokens: int | None,
+    top_k: int | None,
+    repetition_penalty: float | None,
+) -> None:
+    sse_lines = [
+        'data: {"text": "ok", "meta_info": {"prompt_tokens": 1, "completion_tokens": 1, "finish_reason": {"type": "stop"}}}',
+    ]
+    client_instance = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    mock_async_client.return_value = client_instance
+    default_sampling = {"min_new_tokens": 10, "top_k": 17, "repetition_penalty": 1.1}
+    expected_defaults = default_sampling.copy()
+    adapter = SGLangGenerationAdapter("test-model", default_sampling=default_sampling)
+    adapter._server_url = "http://localhost:30005"
+    grammar = grammar_default_sampling_spec
+
+    asyncio.run(
+        collect_generation(
+            adapter.generate(
+                prompt="Hi",
+                max_new_tokens=3,
+                min_new_tokens=min_new_tokens,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                grammar=grammar,
+            )
+        )
+    )
+
+    sampling_params = client_instance.stream.call_args.kwargs["json"]["sampling_params"]
+    assert sampling_params["max_new_tokens"] == 3
+    if min_new_tokens is None:
+        assert "min_new_tokens" not in sampling_params
+    else:
+        assert sampling_params["min_new_tokens"] == min_new_tokens
+    assert sampling_params["top_k"] == (17 if top_k is None else top_k)
+    assert sampling_params["repetition_penalty"] == pytest.approx(
+        1.1 if repetition_penalty is None else repetition_penalty
+    )
+    expected_grammar = json.dumps(grammar.value) if grammar.kind == "json_schema" else grammar.value
+    assert {key: sampling_params[key] for key in ("json_schema", "regex", "ebnf") if key in sampling_params} == {
+        grammar.kind: expected_grammar
+    }
+    assert adapter._default_sampling == expected_defaults
+    assert default_sampling == expected_defaults
+
+    for max_new_tokens in (1, 64):
+        asyncio.run(collect_generation(adapter.generate(prompt="Hi", max_new_tokens=max_new_tokens)))
+        unconstrained_sampling = client_instance.stream.call_args.kwargs["json"]["sampling_params"]
+        assert unconstrained_sampling["min_new_tokens"] == min(10, max_new_tokens)
+        assert unconstrained_sampling["top_k"] == 17
+        assert unconstrained_sampling["repetition_penalty"] == pytest.approx(1.1)
+        assert not {"json_schema", "regex", "ebnf"}.intersection(unconstrained_sampling)
+
+    assert adapter._default_sampling == expected_defaults
+    assert default_sampling == expected_defaults
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_grammar_default_sampling_rejects_explicit_min_above_max(
+    mock_async_client: MagicMock,
+    grammar_default_sampling_spec: GrammarSpec,
+) -> None:
+    adapter = SGLangGenerationAdapter(
+        "test-model",
+        default_sampling={"min_new_tokens": 10, "top_k": 17, "repetition_penalty": 1.1},
+    )
+    adapter._server_url = "http://localhost:30005"
+
+    with pytest.raises(ValueError, match=r"min_new_tokens \(10\) must not exceed max_new_tokens \(1\)"):
+        asyncio.run(
+            collect_generation(
+                adapter.generate(
+                    prompt="Hi",
+                    max_new_tokens=1,
+                    min_new_tokens=10,
+                    grammar=grammar_default_sampling_spec,
+                )
+            )
+        )
+
+    mock_async_client.assert_not_called()
+
+
 @pytest.mark.parametrize("seed", [-1, 0, 1])
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
 def test_generate_maps_seed_to_sglang_sampling_seed(mock_async_client: MagicMock, adapter, seed: int) -> None:
@@ -980,6 +1210,35 @@ def test_generate_aclose_triggers_abort_request(mock_async_client: MagicMock, ad
 
     # /abort_request was POSTed best-effort with the rid carried in the body.
     client_instance.post.assert_awaited()
+    args, _ = client_instance.post.await_args
+    assert args[0].endswith("/abort_request")
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_task_cancellation_triggers_abort_request(mock_async_client: MagicMock, adapter) -> None:
+    class _NeverEnding(_FakeStreamingResponse):
+        async def aiter_lines(self):
+            yield 'data: {"text": "first"}'
+            await asyncio.Event().wait()  # pragma: no cover - cancelled by the test
+
+    client_instance = _make_client_with_stream(_NeverEnding(lines=[]))
+    mock_async_client.return_value = client_instance
+    adapter._server_url = "http://localhost:30005"
+
+    async def _run() -> None:
+        chunks = adapter.generate(prompt="Hi", max_new_tokens=64)
+        assert (await anext(chunks)).text_delta == "first"
+        pending = asyncio.create_task(anext(chunks))
+        await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        if adapter._abort_tasks:
+            await asyncio.gather(*tuple(adapter._abort_tasks))
+
+    asyncio.run(_run())
+
+    client_instance.post.assert_awaited_once()
     args, _ = client_instance.post.await_args
     assert args[0].endswith("/abort_request")
 
