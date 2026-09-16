@@ -22,7 +22,13 @@ from typing import Any, Self
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sie_server.adapters._generation_base import GenerationChunk, collect_generation, suppress_thinking_blocks
+from sie_server.adapters._generation_base import (
+    GenerationChunk,
+    GenerationError,
+    GenerationInvalidRequestError,
+    collect_generation,
+    suppress_thinking_blocks,
+)
 from sie_server.adapters.sglang import _server
 from sie_server.adapters.sglang.cuda13 import SGLangStrictThinkingAdapter
 from sie_server.adapters.sglang.generation import (
@@ -412,7 +418,7 @@ def test_generate_surfaces_in_band_sglang_error(mock_async_client: MagicMock, ad
 
     with pytest.raises(
         RuntimeError,
-        match="SGLang /generate error: vision processor rejected image",
+        match="SGLang /generate returned an in-band error",
     ):
         asyncio.run(_collect())
 
@@ -1583,12 +1589,9 @@ def test_parse_response_with_list_shape() -> None:
     assert result.completion_tokens == 1
 
 
-def test_parse_response_missing_meta_defaults_to_stop() -> None:
-    result = _parse_sglang_generate_response({"text": "xyz"})
-    assert result.text == "xyz"
-    assert result.finish_reason == "stop"
-    assert result.prompt_tokens == 0
-    assert result.completion_tokens == 0
+def test_parse_response_missing_meta_is_an_error() -> None:
+    with pytest.raises(GenerationError, match="without a finish reason"):
+        _parse_sglang_generate_response({"text": "xyz"})
 
 
 def test_chunk_translator_surfaces_logprobs_3tuple() -> None:
@@ -2336,3 +2339,85 @@ print("mm-process-config-ready")
     assert completed.returncode == 0, completed.stderr
     assert "Error in sitecustomize" not in completed.stderr
     assert completed.stdout.strip() == "mm-process-config-ready"
+
+
+@pytest.mark.parametrize(
+    ("n", "stream", "best_of"), [(1, True, None), (2, True, None), (2, False, None), (1, False, 2)]
+)
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_backend_grammar_abort_never_emits_placeholder_or_usage(
+    mock_async_client: MagicMock, adapter, n: int, stream: bool, best_of: int | None
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"value": {"type": ["string", "null"]}},
+        "required": ["value"],
+        "additionalProperties": False,
+    }
+    abort = {
+        "text": "[]",
+        "meta_info": {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "finish_reason": {
+                "type": "abort",
+                "status_code": 400,
+                "message": "Invalid grammar request: private-schema-content",
+            },
+        },
+    }
+    client = _make_client_with_stream(_FakeStreamingResponse(["data: " + json.dumps(abort)]))
+    response = MagicMock()
+    response.json.return_value = [
+        {"text": "valid", "meta_info": {"finish_reason": {"type": "stop"}}},
+        abort,
+    ]
+    client.post = AsyncMock(return_value=response)
+    mock_async_client.return_value = client
+    adapter._server_url = "http://localhost:30005"
+    chunks = []
+
+    async def consume() -> None:
+        async for chunk in adapter.generate(
+            prompt="Extract the optional value.",
+            max_new_tokens=64,
+            n=n,
+            stream=stream,
+            best_of=best_of,
+            grammar=GrammarSpec(kind="json_schema", value=schema),
+        ):
+            chunks.append(chunk)
+
+    with pytest.raises(GenerationInvalidRequestError, match="rejected the requested json_schema grammar") as exc:
+        asyncio.run(consume())
+    assert exc.value.code == "invalid_request"
+    assert exc.value.param == "grammar"
+    assert "private-schema-content" not in str(exc.value)
+    assert chunks == []
+
+
+@pytest.mark.parametrize(
+    "finish", ["abort", "error", "cancelled", {"type": "abort", "status_code": 500}, {"type": "unknown"}]
+)
+def test_chunk_translator_rejects_failed_or_unknown_terminal(finish: Any) -> None:
+    with pytest.raises(GenerationError):
+        _chunk_from_sglang_event(
+            {"text": "[]", "meta_info": {"finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1}},
+            previous_cumulative_text="",
+            first_yield_done=False,
+        )
+
+
+@pytest.mark.parametrize("meta", [None, {}, []])
+def test_chunk_translator_rejects_terminal_without_reason(meta: Any) -> None:
+    with pytest.raises(GenerationError, match="without a finish reason"):
+        _chunk_from_sglang_event(
+            {"text": "[]", "finished": True, "meta_info": meta},
+            previous_cumulative_text="",
+            first_yield_done=False,
+        )
+
+
+def test_legacy_parser_rejects_backend_abort() -> None:
+    with pytest.raises(GenerationError, match="aborted"):
+        _parse_sglang_generate_response({"text": "[]", "meta_info": {"finish_reason": {"type": "abort"}}})

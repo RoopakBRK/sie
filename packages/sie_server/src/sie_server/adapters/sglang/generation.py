@@ -42,6 +42,8 @@ from sie_server.adapters._generation_base import (
     FinishReason,
     GenerationAdapter,
     GenerationChunk,
+    GenerationError,
+    GenerationInvalidRequestError,
     GenerationResult,
 )
 from sie_server.adapters._spec import AdapterSpec
@@ -156,17 +158,27 @@ def _encode_image_data(images: list[ImageInput] | None) -> list[str] | None:
     return encoded
 
 
-def _raise_for_sglang_event_error(event: Any) -> None:
-    """Propagate an error carried inside SGLang's HTTP-200 SSE stream."""
-    if not isinstance(event, dict) or "error" not in event:
-        return
-    error = event["error"]
-    message = error.get("message") if isinstance(error, dict) else error
-    if not isinstance(message, str) or not message.strip():
-        message = "unknown in-band SGLang error"
-    message = message.strip()[:500]
-    logger.error("SGLang /generate in-band error: %s", message)
-    raise RuntimeError(f"SGLang /generate error: {message}")
+def _raise_for_sglang_event_error(event: Any, *, grammar: GrammarSpec | None = None, terminal: bool = False) -> None:
+    """Reject upstream failures before consuming their text or usage."""
+    if not isinstance(event, dict):
+        raise GenerationError("SGLang /generate returned an invalid event")
+    if "error" in event:
+        raise GenerationError("SGLang /generate returned an in-band error")
+    meta = event.get("meta_info")
+    finish = meta.get("finish_reason") if isinstance(meta, dict) else None
+    kind = finish.get("type") if isinstance(finish, dict) else finish
+    if kind == "abort":
+        if isinstance(finish, dict) and finish.get("status_code") == 400:
+            if grammar is not None:
+                raise GenerationInvalidRequestError(
+                    "grammar", f"The generation backend rejected the requested {grammar.kind} grammar"
+                )
+            raise GenerationInvalidRequestError("prompt", "The generation backend rejected the request")
+        raise GenerationError("SGLang /generate aborted the request")
+    if kind is not None and kind not in ("stop", "length"):
+        raise GenerationError("SGLang /generate returned an unsupported finish reason")
+    if (terminal or event.get("finished")) and kind is None:
+        raise GenerationError("SGLang /generate completed without a finish reason")
 
 
 def _tail_file(path: str, *, max_lines: int = 200) -> str:
@@ -1257,7 +1269,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                             event = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        _raise_for_sglang_event_error(event)
+                        _raise_for_sglang_event_error(event, grammar=grammar)
                         idx = int(event.get("index", 0))
                         cumulative = event.get("text", "")
                         if not isinstance(cumulative, str):
@@ -1378,6 +1390,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
             # tolerate a single dict defensively.
             if isinstance(results, dict):
                 results = [results]
+            for result in results:
+                _raise_for_sglang_event_error(result, grammar=grammar, terminal=True)
             if rank:
                 # Highest cumulative token-logprob first; keep the top return_count.
                 results = sorted(results, key=_cumulative_logprob, reverse=True)[:return_count]
@@ -1438,7 +1452,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                 candidates.append(
                     {
                         "text": r.get("text", "") if isinstance(r, dict) else "",
-                        "finish_reason": fr_type if isinstance(fr_type, str) else "stop",
+                        "finish_reason": fr_type,
                         "logprobs": cand_logprobs,
                     }
                 )
@@ -1506,13 +1520,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
         try:
             async with client.stream("POST", f"{self._server_url}/generate", json=body) as response:
                 if response.status_code != 200:
-                    # Drain a bit of the body for diagnostics, then raise.
-                    body_preview = await response.aread()
-                    logger.error(
-                        "SGLang /generate stream error %d: %s",
-                        response.status_code,
-                        body_preview[:500],
-                    )
+                    await response.aread()
+                    logger.error("SGLang /generate stream error %d", response.status_code)
                     response.raise_for_status()
 
                 last_cumulative_text = ""
@@ -1550,10 +1559,10 @@ class SGLangGenerationAdapter(GenerationAdapter):
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
-                        logger.warning("SGLang stream: skipping non-JSON line: %s", line[:200])
+                        logger.warning("SGLang stream: skipping non-JSON line")
                         continue
 
-                    _raise_for_sglang_event_error(event)
+                    _raise_for_sglang_event_error(event, grammar=grammar)
                     chunk = _chunk_from_sglang_event(
                         event,
                         previous_cumulative_text=last_cumulative_text,
@@ -1815,6 +1824,7 @@ def _chunk_from_sglang_event(
     OpenAI ``ChatCompletionTokenLogprob`` shape for the tokens
     introduced by *this* event.
     """
+    _raise_for_sglang_event_error(event)
     if not isinstance(event, dict):
         return None
     cumulative = event.get("text", "")
@@ -1897,11 +1907,7 @@ def _chunk_from_sglang_event(
                 chunk_logprobs = tuple(built)
 
     if is_terminal:
-        finish_reason: FinishReason
-        if raw_finish in ("stop", "length", "cancelled", "error"):
-            finish_reason = raw_finish  # type: ignore[assignment]
-        else:
-            finish_reason = "stop"
+        finish_reason = cast("FinishReason", raw_finish)
         prompt_tokens = meta.get("prompt_tokens") if isinstance(meta, dict) else None
         completion_tokens = meta.get("completion_tokens") if isinstance(meta, dict) else None
         return GenerationChunk(
@@ -1976,6 +1982,7 @@ def _parse_sglang_generate_response(result: Any) -> GenerationResult:
         msg = f"SGLang /generate returned unexpected shape: {type(result).__name__}"
         raise RuntimeError(msg)
 
+    _raise_for_sglang_event_error(result, terminal=True)
     text = result.get("text", "")
     if not isinstance(text, str):
         msg = "SGLang /generate response missing 'text'"
@@ -1988,11 +1995,11 @@ def _parse_sglang_generate_response(result: Any) -> GenerationResult:
     raw_finish = meta.get("finish_reason")
     if isinstance(raw_finish, dict):
         raw_finish = raw_finish.get("type")
-    finish_reason = raw_finish if raw_finish in ("stop", "length") else "stop"
+    finish_reason = cast("FinishReason", raw_finish)
 
     return GenerationResult(
         text=text,
-        finish_reason=finish_reason,  # type: ignore[arg-type]
+        finish_reason=finish_reason,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
     )
