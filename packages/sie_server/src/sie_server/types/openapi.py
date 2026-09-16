@@ -462,6 +462,12 @@ class GenerateUsageModel(BaseModel):
     prompt_tokens: int = Field(..., ge=0, description="Number of prompt tokens")
     completion_tokens: int = Field(..., ge=0, description="Number of generated tokens")
     total_tokens: int = Field(..., ge=0, description="Total prompt and generated tokens")
+    images: int | None = Field(
+        default=None,
+        ge=1,
+        le=(1 << 32) - 1,
+        description="Observed input images on successful image-conditioned generation; omitted for text-only requests",
+    )
 
 
 class GenerateResponseModel(BaseModel):
