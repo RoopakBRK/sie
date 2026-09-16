@@ -239,6 +239,9 @@ def _parse_generate_result(
             "completion_tokens": _coerce_token_count(usage.get("completion_tokens")),
             "total_tokens": _coerce_token_count(usage.get("total_tokens")),
         }
+        images = usage.get("images")
+        if isinstance(images, int) and not isinstance(images, bool) and 0 < images <= 2**32 - 1:
+            parsed_usage["images"] = images
         settled = settled_charge_from_usage(usage)
         if settled is not None:
             parsed_usage["credits_charged"], parsed_usage["rate_book_version"] = settled

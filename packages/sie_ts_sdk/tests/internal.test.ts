@@ -677,3 +677,17 @@ describe("parseGenerateResult usage coercion (BUG 13c)", () => {
     });
   });
 });
+
+describe("authoritative generation image usage", () => {
+  it.each([1, 2])("preserves %i observed images", (images) => {
+    const result = parseGenerateResult({ model: "m", text: "ok", usage: { images } });
+    expect(result.usage.images).toBe(images);
+  });
+  it.each([undefined, null, 0, -1, 1.5, "1", true, Number.MAX_SAFE_INTEGER + 1])(
+    "omits missing or malformed image usage %s",
+    (images) => {
+      const result = parseGenerateResult({ model: "m", text: "ok", usage: { images } });
+      expect(result.usage).not.toHaveProperty("images");
+    },
+  );
+});

@@ -3951,3 +3951,78 @@ async def test_streaming_processor_reserves_capped_visual_tokens(monkeypatch) ->
     assert terminal["error"]["code"] == "context_exceeded"
     assert "~image_tokens (1280)" in terminal["error"]["message"]
     msg.ack.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_count", [0, 1, 2])
+@pytest.mark.parametrize("finish_reason", ["stop", "error", "cancelled"])
+async def test_terminal_image_usage_counts_executed_images_only(
+    monkeypatch: pytest.MonkeyPatch, image_count: int, finish_reason: str
+) -> None:
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = "rendered prompt"
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", AsyncMock(return_value=tokenizer))
+    adapter = _FakeGenAdapter(
+        [
+            GenerationChunk(text_delta="ok", is_first=True),
+            GenerationChunk(
+                text_delta="",
+                done=True,
+                finish_reason=finish_reason,
+                prompt_tokens=5,
+                completion_tokens=2,
+            ),
+        ]
+    )
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=_make_registry(adapter), worker_id="w1")
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "describe",
+                    "images": [{"data": b"image", "format": "png"}] * image_count,
+                }
+            ],
+            "max_new_tokens": 8,
+        }
+    )
+    await proc.process(_make_msg(wi), "test/model")
+    chunks = [msgpack.unpackb(call.args[1], raw=False) for call in nc.publish.call_args_list]
+    terminal = next(chunk for chunk in chunks if chunk.get("done"))
+    usage = terminal["usage"]
+    assert usage["prompt_tokens"] == 5
+    assert usage["completion_tokens"] == 2
+    if image_count and finish_reason == "stop":
+        assert usage["images"] == image_count
+    else:
+        assert "images" not in usage
+    assert all("images" not in chunk.get("usage", {}) for chunk in chunks if not chunk.get("done"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("emit_terminal", [False, True])
+async def test_image_generation_without_token_counts_does_not_synthesize_usage(
+    monkeypatch: pytest.MonkeyPatch, emit_terminal: bool
+) -> None:
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = "rendered prompt"
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", AsyncMock(return_value=tokenizer))
+    script = [GenerationChunk(text_delta="ok", is_first=True)]
+    if emit_terminal:
+        script.append(GenerationChunk(text_delta="", done=True, finish_reason="stop"))
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=_make_registry(_FakeGenAdapter(script)), worker_id="w1")
+    wi = _make_work_item(
+        generate={
+            "messages": [{"role": "user", "content": "describe", "images": [{"data": b"image", "format": "png"}]}],
+            "max_new_tokens": 8,
+        }
+    )
+
+    await proc.process(_make_msg(wi), "test/model")
+
+    terminal = _terminal_chunk(nc)
+    assert terminal["done"] is True
+    assert "usage" not in terminal

@@ -467,6 +467,11 @@ class TestGenerateEndpoint:
         assert fake_adapter.last_call is not None
         assert fake_adapter.last_call["prompt"] == "<image>Read the image"
         assert fake_adapter.last_call["images"] == [{"data": b"hello", "format": "png"}]
+        if stream:
+            chunks = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+            assert chunks[-1]["usage"]["images"] == 1
+        else:
+            assert response.json()["usage"]["images"] == 1
 
     @pytest.mark.parametrize("enable_thinking", [False, True])
     def test_native_image_prompt_uses_pinned_trusted_model_tokenizer(

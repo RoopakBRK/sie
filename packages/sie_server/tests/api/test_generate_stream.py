@@ -151,6 +151,7 @@ def _events(
     *,
     suppress_thinking: bool = False,
     preflight_result: GenerationPreflightResult | None = None,
+    images: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[str]:
     return _stream_generate_events(
         adapter,
@@ -170,6 +171,7 @@ def _events(
         top_logprobs=3,
         suppress_thinking=suppress_thinking,
         preflight_result=preflight_result,
+        images=images,
     )
 
 
@@ -648,3 +650,19 @@ async def test_done_is_final_sse_line() -> None:
     ]
     raw = await _drain(_FakeAdapter(chunks))
     assert raw[-1].strip() == "data: [DONE]"
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "error", "cancelled"])
+async def test_stream_image_usage_requires_success(finish_reason: str) -> None:
+    adapter = _FakeAdapter(
+        [
+            GenerationChunk(
+                text_delta="", done=True, finish_reason=finish_reason, prompt_tokens=5, completion_tokens=2
+            ),
+        ]
+    )
+    events, _ = _parse_sse([event async for event in _events(adapter, images=[{"data": b"image", "format": "png"}])])
+    if finish_reason == "stop":
+        assert events[-1]["usage"]["images"] == 1
+    else:
+        assert "images" not in events[-1]["usage"]

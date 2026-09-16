@@ -950,6 +950,8 @@ async def _stream_generate_events(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+    if images and terminal_error is None and finish_reason not in {"error", "cancelled"}:
+        terminal["usage"]["images"] = len(images)
     if ttft_ms is not None:
         terminal["ttft_ms"] = ttft_ms
     if terminal_error is not None:
@@ -1369,6 +1371,7 @@ async def generate(
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
                     "total_tokens": result.prompt_tokens + result.completion_tokens,
+                    **({"images": len(images)} if images else {}),
                 },
             }
         )

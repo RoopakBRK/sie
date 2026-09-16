@@ -1411,6 +1411,20 @@
             "minimum": 0.0,
             "title": "Total Tokens",
             "description": "Total prompt and generated tokens"
+          },
+          "images": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 4294967295.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Images",
+            "description": "Observed input images on successful image-conditioned generation; omitted for text-only requests"
           }
         },
         "type": "object",

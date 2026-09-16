@@ -1979,6 +1979,10 @@ pub struct GenerateUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Number of input images observed by the worker after successful execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1)]
+    pub images: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2288,6 +2292,10 @@ pub struct ChatCompletionUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Number of input images observed by the worker after successful execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1)]
+    pub images: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

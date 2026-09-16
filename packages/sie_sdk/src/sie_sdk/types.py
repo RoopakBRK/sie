@@ -599,6 +599,7 @@ class GenerationUsage(TypedDict):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    images: NotRequired[int]
     credits_charged: NotRequired[int]
     rate_book_version: NotRequired[str]
 
@@ -727,6 +728,7 @@ class ChatUsage(TypedDict):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    images: NotRequired[int]
 
 
 class ChatChoice(TypedDict, total=False):
