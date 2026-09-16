@@ -100,6 +100,48 @@ def test_mise_workflow_setups_pin_concrete_versions():
                     )
 
 
+def test_mise_bootstrap_serializes_the_complete_toolset():
+    # Partial installs defer the other tools to `mise exec`, outside install_args.
+    for path in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+        workflow = yaml.safe_load(path.read_text())
+        for name, job in workflow["jobs"].items():
+            for step in job.get("steps", []):
+                if not step.get("uses", "").startswith("jdx/mise-action@"):
+                    continue
+                inputs = step.get("with", {})
+                if inputs.get("install", True) is not False:
+                    assert shlex.split(inputs.get("install_args", "")) == ["--jobs=1"], (
+                        f"{path.name}: {name} must serialize the full tool install to avoid Node GPG races"
+                    )
+
+
+@pytest.mark.parametrize("install_status", [0, 1])
+def test_init_serializes_install_and_stops_on_failure(tmp_path, install_status):
+    log = tmp_path / "mise.log"
+    mise = tmp_path / "mise"
+    mise.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$MISE_TEST_LOG"\n'
+        'if [ "$1" = install ]; then exit "$MISE_TEST_INSTALL_STATUS"; fi\n'
+    )
+    mise.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(ROOT / "tools/init.sh")],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "MISE_TEST_LOG": str(log),
+            "MISE_TEST_INSTALL_STATUS": str(install_status),
+        },
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == install_status
+    expected = ["trust", "install --jobs=1"]
+    if install_status == 0:
+        expected.append("run full-sync")
+    assert log.read_text().splitlines() == expected
+
+
 @pytest.mark.parametrize(("mutate_lock", "old_venv", "code"), [(False, False, 0), (True, False, 1), (False, True, 1)])
 def test_bootstrap_rejects_reused_environment_and_changed_lock(tmp_path, mutate_lock, old_venv, code):
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
