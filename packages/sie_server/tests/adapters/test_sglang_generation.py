@@ -2817,3 +2817,35 @@ async def test_http_error_read_is_bounded_and_closes_stream(adapter, mode, n, st
         await iterator.aclose()
     assert closed.is_set()
     assert reads == ([1] if mode == "oversized" else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "encoding", ["gzip", "br", "GZIP", "IDENTITY", "identity, gzip", "identity, identity", "unknown", ""]
+)
+@pytest.mark.parametrize(
+    ("n", "stream", "best_of"), [(1, False, None), (2, True, None), (2, False, None), (1, False, 2)]
+)
+async def test_encoded_http_error_is_not_read_or_decompressed(adapter, encoding, n, stream, best_of) -> None:
+    closed = asyncio.Event()
+
+    class EncodedErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise AssertionError("encoded error must not be read or decompressed")
+            yield b""
+
+        async def aclose(self):
+            closed.set()
+
+    def respond(_):
+        return httpx.Response(400, headers={"Content-Encoding": encoding}, stream=EncodedErrorStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        adapter._http_client = client
+        adapter._server_url = "http://localhost:30005"
+        with pytest.raises(httpx.HTTPStatusError):
+            async for _ in adapter.generate(
+                prompt="Optional value", max_new_tokens=8, grammar=_TYPE_GRAMMAR, n=n, stream=stream, best_of=best_of
+            ):
+                raise AssertionError("error response must not yield a generation chunk")
+    assert closed.is_set()

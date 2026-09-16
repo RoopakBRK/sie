@@ -3661,6 +3661,7 @@ class StreamingProcessor:
                     message=OUTLINES_JSON_SCHEMA_TYPE_MESSAGE
                     if known_type_refusal
                     else _INTERNAL_GRAMMAR_COMPILE_MESSAGE,
+                    param="grammar" if known_type_refusal else None,
                     msg=msg,
                 )
                 return False
@@ -3803,6 +3804,11 @@ class StreamingProcessor:
                 seq=0,
                 code=exc.code,
                 message=str(exc),
+                param="grammar"
+                if grammar.kind == "json_schema"
+                and exc.code == "invalid_request"
+                and exc.args == (OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,)
+                else None,
                 msg=msg,
             )
             return False

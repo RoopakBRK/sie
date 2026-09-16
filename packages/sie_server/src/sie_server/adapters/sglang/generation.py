@@ -183,6 +183,7 @@ async def _raise_for_sglang_http_error(
         and grammar_backend == "outlines"
         and grammar is not None
         and grammar.kind == "json_schema"
+        and response.headers.get("content-encoding", "identity") == "identity"
     ):
 
         async def read_error() -> bytes:

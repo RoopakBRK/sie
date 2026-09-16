@@ -4138,12 +4138,15 @@ async def test_known_type_refusal_is_identical_for_preflight_leader_and_follower
     terminals = [msgpack.unpackb(call.args[1], raw=False) for call in nc.publish.call_args_list]
     assert len(terminals) == 2
     for index, terminal in enumerate(terminals):
-        assert terminal["error"] == {"code": "invalid_request", "message": OUTLINES_JSON_SCHEMA_TYPE_MESSAGE}
+        assert terminal["error"] == {
+            "code": "invalid_request",
+            "message": OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+            "param": "grammar",
+        }
         assert terminal["request_id"] == f"req-{index}"
         assert terminal["attempt_id"] == f"att-{index}"
         assert terminal["finish_reason"] == "error"
-        assert terminal.get("prompt_tokens") is None
-        assert terminal.get("completion_tokens") is None
+        assert terminal.get("usage") is None
         messages[index].ack.assert_awaited_once()
         messages[index].nak.assert_not_awaited()
     assert proc._grammar_inflight == {}
@@ -4168,7 +4171,6 @@ async def test_backend_type_refusal_survives_worker_terminal_and_settlement(monk
         "param": "grammar",
     }
     assert terminal["finish_reason"] == "error"
-    assert terminal.get("prompt_tokens") is None
-    assert terminal.get("completion_tokens") is None
+    assert terminal.get("usage") is None
     message.ack.assert_awaited_once()
     assert adapter.close_calls == 1
