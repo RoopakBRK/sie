@@ -167,6 +167,8 @@ def _raise_for_sglang_event_error(event: Any, *, grammar: GrammarSpec | None = N
     meta = event.get("meta_info")
     finish = meta.get("finish_reason") if isinstance(meta, dict) else None
     kind = finish.get("type") if isinstance(finish, dict) else finish
+    if finish is not None and kind is None:
+        raise GenerationError("SGLang /generate returned a malformed finish reason")
     if kind == "abort":
         if isinstance(finish, dict) and finish.get("status_code") == 400:
             if grammar is not None:

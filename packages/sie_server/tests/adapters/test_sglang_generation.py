@@ -2421,3 +2421,13 @@ def test_chunk_translator_rejects_terminal_without_reason(meta: Any) -> None:
 def test_legacy_parser_rejects_backend_abort() -> None:
     with pytest.raises(GenerationError, match="aborted"):
         _parse_sglang_generate_response({"text": "[]", "meta_info": {"finish_reason": {"type": "abort"}}})
+
+
+@pytest.mark.parametrize("finish", [{}, {"type": None}])
+def test_chunk_translator_rejects_malformed_nonnull_finish_metadata(finish: Any) -> None:
+    with pytest.raises(GenerationError, match="malformed finish reason"):
+        _chunk_from_sglang_event(
+            {"text": "[]", "meta_info": {"finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1}},
+            previous_cumulative_text="",
+            first_yield_done=False,
+        )
