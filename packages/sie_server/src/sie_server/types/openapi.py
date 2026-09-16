@@ -735,6 +735,8 @@ class GenerateChunk(BaseModel):
                 {
                     "required": ["execution_identity_sha256", "execution_binding_sha256"],
                     "properties": {
+                        "done": {"const": True},
+                        "error": {"type": "null"},
                         "execution_identity_sha256": {"type": "string"},
                         "execution_binding_sha256": {"type": "string"},
                     },

@@ -263,11 +263,23 @@ def test_openapi_version_from_package() -> None:
         ({"execution_identity_sha256": "A" * 64, "execution_binding_sha256": "b" * 64}, False),
         ({"execution_identity_sha256": "a" * 63, "execution_binding_sha256": "b" * 64}, False),
         ({"execution_identity_sha256": None, "execution_binding_sha256": None}, False),
+        ({"execution_identity_sha256": "a" * 64, "execution_binding_sha256": "b" * 64, "done": False}, False),
+        (
+            {
+                "execution_identity_sha256": "a" * 64,
+                "execution_binding_sha256": "b" * 64,
+                "error": {"code": "INTERNAL", "message": "Generation failed"},
+            },
+            False,
+        ),
+        ({"execution_identity_sha256": "a" * 64, "execution_binding_sha256": "b" * 64, "error": None}, True),
+        ({"done": False}, True),
+        ({"error": {"code": "INTERNAL", "message": "Generation failed"}}, True),
     ],
 )
 def test_native_stream_schema_requires_complete_execution_evidence(package: str, evidence: dict, valid: bool) -> None:
     spec_path = Path(__file__).resolve().parents[3] / "packages" / package / "openapi.json"
     spec = json.loads(spec_path.read_text())
-    validator = Draft202012Validator(spec["components"]["schemas"]["GenerateChunk"])
+    validator = Draft202012Validator({"$ref": "#/components/schemas/GenerateChunk", "components": spec["components"]})
     terminal = {"request_id": "request-1", "seq": 1, "text_delta": "", "done": True, **evidence}
     assert validator.is_valid(terminal) is valid

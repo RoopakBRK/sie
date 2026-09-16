@@ -3041,6 +3041,12 @@
         "oneOf": [
           {
             "properties": {
+              "done": {
+                "const": true
+              },
+              "error": {
+                "type": "null"
+              },
               "execution_identity_sha256": {
                 "type": "string"
               },

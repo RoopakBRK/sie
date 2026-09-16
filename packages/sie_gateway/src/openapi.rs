@@ -284,7 +284,10 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
         .and_then(|schemas| schemas.get_mut("GenerateChunk"))
     {
         chunk["oneOf"] = json!([
-            {"required": ["execution_identity_sha256", "execution_binding_sha256"]},
+            {
+                "required": ["execution_identity_sha256", "execution_binding_sha256"],
+                "properties": {"done": {"const": true}, "error": {"type": "null"}}
+            },
             {"not": {"anyOf": [
                 {"required": ["execution_identity_sha256"]},
                 {"required": ["execution_binding_sha256"]}
@@ -3543,7 +3546,10 @@ mod tests {
         assert_eq!(
             chunk["oneOf"],
             json!([
-                {"required": ["execution_identity_sha256", "execution_binding_sha256"]},
+                {
+                    "required": ["execution_identity_sha256", "execution_binding_sha256"],
+                    "properties": {"done": {"const": true}, "error": {"type": "null"}}
+                },
                 {"not": {"anyOf": [
                     {"required": ["execution_identity_sha256"]},
                     {"required": ["execution_binding_sha256"]}
