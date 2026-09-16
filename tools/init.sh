@@ -13,7 +13,8 @@ echo "Trusting mise config..."
 mise trust
 
 echo "Installing mise tools and deps..."
-mise install
+# The pinned Node versions share GPG bootstrap state; install them sequentially.
+mise install --jobs=1
 mise run full-sync
 
 if ! command -v cmake >/dev/null 2>&1; then

@@ -31,6 +31,7 @@ jobs:
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
         with:
           version: 2026.5.5
+          install_args: --jobs=1
       - name: Validate, render, and retain the exact chart
         env:
           RELEASE_VERSION: ${{ inputs.version }}
@@ -96,6 +97,7 @@ jobs:
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
         with:
           version: 2026.5.5
+          install_args: --jobs=1
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
