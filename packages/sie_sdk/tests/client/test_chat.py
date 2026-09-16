@@ -237,13 +237,7 @@ def test_stream_generate_yields_chunks_and_normalizes_model_path() -> None:
 
 @pytest.mark.parametrize("with_evidence", [False, True])
 def test_stream_generate_preserves_optional_terminal_execution_evidence(with_evidence: bool) -> None:
-    terminal: GenerateChunk = {
-        "request_id": "request-1",
-        "seq": 1,
-        "text_delta": "",
-        "done": True,
-        "finish_reason": "stop",
-    }
+    terminal = GenerateChunk(request_id="request-1", seq=1, text_delta="", done=True, finish_reason="stop")
     if with_evidence:
         terminal.update(execution_identity_sha256="a" * 64, execution_binding_sha256="b" * 64)
     delta = {"request_id": "request-1", "seq": 0, "text_delta": "Hello", "done": False}

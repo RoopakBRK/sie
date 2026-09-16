@@ -3,6 +3,8 @@ import tomllib
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 
+import pytest
+from jsonschema import Draft202012Validator
 from sie_server.cli import app
 from typer.testing import CliRunner
 
@@ -248,3 +250,24 @@ def test_openapi_version_from_package() -> None:
     assert pkg_version("sie-server") == project_version
     assert spec["info"]["version"] == project_version
     assert committed_spec["info"]["version"] == project_version
+
+
+@pytest.mark.parametrize("package", ["sie_server", "sie_gateway"])
+@pytest.mark.parametrize(
+    ("evidence", "valid"),
+    [
+        ({}, True),
+        ({"execution_identity_sha256": "a" * 64, "execution_binding_sha256": "b" * 64}, True),
+        ({"execution_identity_sha256": "a" * 64}, False),
+        ({"execution_binding_sha256": "b" * 64}, False),
+        ({"execution_identity_sha256": "A" * 64, "execution_binding_sha256": "b" * 64}, False),
+        ({"execution_identity_sha256": "a" * 63, "execution_binding_sha256": "b" * 64}, False),
+        ({"execution_identity_sha256": None, "execution_binding_sha256": None}, False),
+    ],
+)
+def test_native_stream_schema_requires_complete_execution_evidence(package: str, evidence: dict, valid: bool) -> None:
+    spec_path = Path(__file__).resolve().parents[3] / "packages" / package / "openapi.json"
+    spec = json.loads(spec_path.read_text())
+    validator = Draft202012Validator(spec["components"]["schemas"]["GenerateChunk"])
+    terminal = {"request_id": "request-1", "seq": 1, "text_delta": "", "done": True, **evidence}
+    assert validator.is_valid(terminal) is valid

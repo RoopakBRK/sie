@@ -278,6 +278,20 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
         }
     });
 
+    if let Some(chunk) = value
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(|schemas| schemas.get_mut("GenerateChunk"))
+    {
+        chunk["oneOf"] = json!([
+            {"required": ["execution_identity_sha256", "execution_binding_sha256"]},
+            {"not": {"anyOf": [
+                {"required": ["execution_identity_sha256"]},
+                {"required": ["execution_binding_sha256"]}
+            ]}}
+        ]);
+    }
+
     if let Some(create_pool) = value
         .get_mut("components")
         .and_then(|components| components.get_mut("schemas"))
@@ -3526,6 +3540,16 @@ mod tests {
                 .unwrap()
                 .contains(&json!(field)));
         }
+        assert_eq!(
+            chunk["oneOf"],
+            json!([
+                {"required": ["execution_identity_sha256", "execution_binding_sha256"]},
+                {"not": {"anyOf": [
+                    {"required": ["execution_identity_sha256"]},
+                    {"required": ["execution_binding_sha256"]}
+                ]}}
+            ])
+        );
         let revision = &spec["paths"]["/v1/generate/{model}"]["post"]["responses"]["200"]
             ["headers"]["X-SIE-Model-Revision"];
         assert_eq!(revision["schema"]["pattern"], "^[0-9a-f]{64}$");

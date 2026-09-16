@@ -1505,6 +1505,30 @@
       },
       "GenerateChunk": {
         "description": "One JSON payload from a SIE-native generation SSE ``data:`` event.\nThe stream is terminated separately by the literal ``data: [DONE]``.",
+        "oneOf": [
+          {
+            "required": [
+              "execution_identity_sha256",
+              "execution_binding_sha256"
+            ]
+          },
+          {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "execution_identity_sha256"
+                  ]
+                },
+                {
+                  "required": [
+                    "execution_binding_sha256"
+                  ]
+                }
+              ]
+            }
+          }
+        ],
         "properties": {
           "done": {
             "type": "boolean"
