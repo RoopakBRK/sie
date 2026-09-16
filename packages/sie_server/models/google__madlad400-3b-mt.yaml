@@ -40,3 +40,5 @@ profiles:
         first_chunk_timeout_s: 180
         inter_chunk_timeout_s: 10
         overall_timeout_s: 600
+        default_sampling:
+          temperature: 0.0
