@@ -29,6 +29,7 @@ from sie_server.adapters._generation_base import (
     GenerationChunk,
     GenerationError,
     GenerationInputTooLongError,
+    GenerationInvalidRequestError,
     GenerationUnsupportedFieldError,
 )
 from sie_server.adapters._spec import AdapterSpec
@@ -38,7 +39,7 @@ from sie_server.config.model import ModelConfig
 from sie_server.observability import worker_telemetry as worker_metrics
 from sie_server.processors import streaming as streaming_mod
 from sie_server.processors.streaming import StreamingProcessor, _ValidationError
-from sie_server.types.grammar import GrammarSpec
+from sie_server.types.grammar import OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, GrammarSpec, GrammarValidationError
 
 _GEMMA_OPEN = "<" + "|channel" + ">" + "thought\n"
 _GEMMA_CLOSE = "<" + "channel|" + ">"
@@ -4084,3 +4085,90 @@ async def test_native_raw_prompt_is_preserved_with_served_template_settings(
     assert adapter.dispatched_parameters is not None
     assert adapter.dispatched_parameters["prompt"] == prompt
     render.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_known_type_refusal_is_identical_for_preflight_leader_and_follower(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    following = asyncio.Event()
+    release = threading.Event()
+    real_wait_for = streaming_mod._wait_for
+
+    def reject(_tok, _grammar):
+        loop.call_soon_threadsafe(started.set)
+        if not release.wait(timeout=5):
+            raise AssertionError("compile was not released")
+        raise GrammarValidationError(OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, code="invalid_request", param="grammar")
+
+    calls = _patch_compile(monkeypatch, reject)
+    registry = _make_registry(_FakeGenAdapter([]))
+    registry.get_config.side_effect = KeyError("no config")
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    grammar = GrammarSpec(kind="json_schema", value={"type": ["string", "null"]})
+    messages = [_make_msg(_make_work_item()) for _ in range(2)]
+
+    def wait_for(awaitable, *, timeout):
+        if any(awaitable is future for future in proc._grammar_inflight.values()):
+            following.set()
+        return real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(streaming_mod, "_wait_for", wait_for)
+
+    async def run(index):
+        return await proc._ensure_grammar_ready(
+            grammar,
+            model_id="test/model",
+            reply_subject="_INBOX.test",
+            request_id=f"req-{index}",
+            attempt_id=f"att-{index}",
+            msg=messages[index],
+        )
+
+    leader = asyncio.create_task(run(0))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        follower = asyncio.create_task(run(1))
+        await asyncio.wait_for(following.wait(), timeout=3)
+    finally:
+        release.set()
+    assert await asyncio.gather(leader, follower) == [False, False]
+    assert len(calls) == 1
+    terminals = [msgpack.unpackb(call.args[1], raw=False) for call in nc.publish.call_args_list]
+    assert len(terminals) == 2
+    for index, terminal in enumerate(terminals):
+        assert terminal["error"] == {"code": "invalid_request", "message": OUTLINES_JSON_SCHEMA_TYPE_MESSAGE}
+        assert terminal["request_id"] == f"req-{index}"
+        assert terminal["attempt_id"] == f"att-{index}"
+        assert terminal["finish_reason"] == "error"
+        assert terminal.get("prompt_tokens") is None
+        assert terminal.get("completion_tokens") is None
+        messages[index].ack.assert_awaited_once()
+        messages[index].nak.assert_not_awaited()
+    assert proc._grammar_inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_backend_type_refusal_survives_worker_terminal_and_settlement(monkeypatch) -> None:
+    nc = AsyncMock()
+    adapter = _PreflightGenAdapter(
+        GenerationInvalidRequestError("grammar", OUTLINES_JSON_SCHEMA_TYPE_MESSAGE), raise_during_generate=True
+    )
+    registry = _make_registry(adapter)
+    registry.get_config.return_value = _make_generation_config()
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    monkeypatch.setattr(proc, "_check_context_length", AsyncMock(return_value=None))
+    message = _make_msg(_make_work_item())
+    await proc.process(message, "test/model")
+    terminal = _decode_chunks(nc)[-1]
+    assert terminal["error"] == {
+        "code": "invalid_request",
+        "message": OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+        "param": "grammar",
+    }
+    assert terminal["finish_reason"] == "error"
+    assert terminal.get("prompt_tokens") is None
+    assert terminal.get("completion_tokens") is None
+    message.ack.assert_awaited_once()
+    assert adapter.close_calls == 1

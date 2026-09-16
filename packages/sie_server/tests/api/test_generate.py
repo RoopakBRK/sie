@@ -24,6 +24,7 @@ from sie_server.adapters._generation_base import (
     GenerationDrainingError,
     GenerationError,
     GenerationInputTooLongError,
+    GenerationInvalidRequestError,
     GenerationUnsupportedFieldError,
 )
 from sie_server.adapters._spec import AdapterSpec
@@ -41,7 +42,7 @@ from sie_server.config.model import (
     Tasks,
 )
 from sie_server.core.registry import ModelRegistry
-from sie_server.types.grammar import GrammarSpec
+from sie_server.types.grammar import OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, GrammarSpec
 from sie_server.types.inputs import ImageInput
 
 _GEMMA_OPEN = "<" + "|channel" + ">" + "thought\n"
@@ -1517,6 +1518,22 @@ class TestGenerateEndpoint:
         assert response.json()["detail"]["code"] == "unsupported_field"
         assert response.json()["detail"]["param"] == "top_k"
         assert adapter.events == ["preflight"]
+
+    def test_backend_type_refusal_is_actual_buffered_400(self, client: TestClient, registry: MagicMock) -> None:
+        adapter = _PreflightAdapter(
+            GenerationInvalidRequestError("grammar", OUTLINES_JSON_SCHEMA_TYPE_MESSAGE), raise_during_generate=True
+        )
+        registry.get.return_value = adapter
+        response = client.post(
+            "/v1/generate/Qwen__Qwen3-4B-Instruct", json={"prompt": "Optional value", "max_new_tokens": 8}
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == {
+            "code": "invalid_request",
+            "message": OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+            "param": "grammar",
+        }
+        assert adapter.events == ["preflight", "generate"]
 
     def test_preflight_input_too_long_is_exact_400(
         self,

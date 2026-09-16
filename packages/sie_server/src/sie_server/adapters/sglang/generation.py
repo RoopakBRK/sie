@@ -50,7 +50,11 @@ from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.adapters.sglang import _server
 from sie_server.observability.generation_diagnostics import GenerationStreamTimer
-from sie_server.types.grammar import GrammarSpec
+from sie_server.types.grammar import (
+    OUTLINES_JSON_SCHEMA_TYPE_DIAGNOSTIC,
+    OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+    GrammarSpec,
+)
 from sie_server.types.inputs import ImageInput, media_bytes
 
 logger = logging.getLogger(__name__)
@@ -158,7 +162,51 @@ def _encode_image_data(images: list[ImageInput] | None) -> list[str] | None:
     return encoded
 
 
-def _raise_for_sglang_event_error(event: Any, *, grammar: GrammarSpec | None = None, terminal: bool = False) -> None:
+_JSON_SCHEMA_TYPE_DIAGNOSTIC = f"Failed to compile json grammar: {OUTLINES_JSON_SCHEMA_TYPE_DIAGNOSTIC}"
+_MAX_ERROR_BODY_BYTES = 4096
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("SGLang /generate returned duplicate JSON keys")
+        result[key] = value
+    return result
+
+
+async def _raise_for_sglang_http_error(
+    response: httpx.Response, *, grammar: GrammarSpec | None, grammar_backend: str | None
+) -> None:
+    if (
+        response.status_code == 400
+        and grammar_backend == "outlines"
+        and grammar is not None
+        and grammar.kind == "json_schema"
+    ):
+
+        async def read_error() -> bytes:
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(body) + len(chunk) > _MAX_ERROR_BODY_BYTES:
+                    return b""
+                body.extend(chunk)
+            return bytes(body)
+
+        try:
+            body = await asyncio.wait_for(read_error(), timeout=1.0)
+            payload = json.loads(body, object_pairs_hook=_unique_json_object)
+        except (ValueError, RecursionError, httpx.HTTPError, TimeoutError):
+            pass
+        else:
+            if payload == {"error": {"message": _JSON_SCHEMA_TYPE_DIAGNOSTIC}}:
+                raise GenerationInvalidRequestError("grammar", OUTLINES_JSON_SCHEMA_TYPE_MESSAGE)
+    response.raise_for_status()
+
+
+def _raise_for_sglang_event_error(
+    event: Any, *, grammar: GrammarSpec | None = None, grammar_backend: str | None = None, terminal: bool = False
+) -> None:
     """Reject upstream failures before consuming their text or usage."""
     if not isinstance(event, dict):
         raise GenerationError("SGLang /generate returned an invalid event")
@@ -170,8 +218,14 @@ def _raise_for_sglang_event_error(event: Any, *, grammar: GrammarSpec | None = N
     if finish is not None and kind is None:
         raise GenerationError("SGLang /generate returned a malformed finish reason")
     if kind == "abort":
-        if isinstance(finish, dict) and finish.get("status_code") == 400:
+        if isinstance(finish, dict) and type(finish.get("status_code")) is int and finish["status_code"] == 400:
             if grammar is not None:
+                if (
+                    grammar_backend == "outlines"
+                    and grammar.kind == "json_schema"
+                    and finish.get("message") == _JSON_SCHEMA_TYPE_DIAGNOSTIC
+                ):
+                    raise GenerationInvalidRequestError("grammar", OUTLINES_JSON_SCHEMA_TYPE_MESSAGE)
                 raise GenerationInvalidRequestError(
                     "grammar", f"The generation backend rejected the requested {grammar.kind} grammar"
                 )
@@ -1254,7 +1308,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
             terminal_yielded = False
             try:
                 async with sclient.stream("POST", f"{self._server_url}/generate", json=sbody) as sresp:
-                    sresp.raise_for_status()
+                    await _raise_for_sglang_http_error(sresp, grammar=grammar, grammar_backend=self._grammar_backend)
                     async for raw_line in sresp.aiter_lines():
                         line = raw_line.strip()
                         if line.startswith("data:"):
@@ -1262,10 +1316,10 @@ class SGLangGenerationAdapter(GenerationAdapter):
                         if not line or line == "[DONE]":
                             continue
                         try:
-                            event = json.loads(line)
+                            event = json.loads(line, object_pairs_hook=_unique_json_object)
                         except json.JSONDecodeError:
                             continue
-                        _raise_for_sglang_event_error(event, grammar=grammar)
+                        _raise_for_sglang_event_error(event, grammar=grammar, grammar_backend=self._grammar_backend)
                         idx = event.get("index")
                         if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < return_count:
                             raise GenerationError("SGLang /generate returned an invalid candidate index")
@@ -1387,9 +1441,10 @@ class SGLangGenerationAdapter(GenerationAdapter):
                 if top_logprobs is not None and top_logprobs > 0:
                     nbody["top_logprobs_num"] = top_logprobs
             nclient = await self._get_or_create_http_client()
-            nresp = await nclient.post(f"{self._server_url}/generate", json=nbody)
-            nresp.raise_for_status()
-            results = nresp.json()
+            async with nclient.stream("POST", f"{self._server_url}/generate", json=nbody) as nresp:
+                await _raise_for_sglang_http_error(nresp, grammar=grammar, grammar_backend=self._grammar_backend)
+                await nresp.aread()
+                results = nresp.json(object_pairs_hook=_unique_json_object)
             # SGLang returns a list of ``n`` result objects for ``n > 1``;
             # tolerate a single dict defensively.
             if isinstance(results, dict):
@@ -1397,7 +1452,9 @@ class SGLangGenerationAdapter(GenerationAdapter):
             if not isinstance(results, list):
                 raise GenerationError("SGLang /generate returned an invalid candidate list")
             for result in results:
-                _raise_for_sglang_event_error(result, grammar=grammar, terminal=True)
+                _raise_for_sglang_event_error(
+                    result, grammar=grammar, grammar_backend=self._grammar_backend, terminal=True
+                )
             if len(results) != gen_count:
                 raise GenerationError("SGLang /generate returned an incorrect candidate count")
             if rank:
@@ -1527,10 +1584,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
         terminal_yielded = False
         try:
             async with client.stream("POST", f"{self._server_url}/generate", json=body) as response:
-                if response.status_code != 200:
-                    await response.aread()
-                    logger.error("SGLang /generate stream error %d", response.status_code)
-                    response.raise_for_status()
+                await _raise_for_sglang_http_error(response, grammar=grammar, grammar_backend=self._grammar_backend)
 
                 last_cumulative_text = ""
                 first_yield_done = False
@@ -1553,12 +1607,12 @@ class SGLangGenerationAdapter(GenerationAdapter):
                     if not line or line == "[DONE]":
                         continue
                     try:
-                        event = json.loads(line)
+                        event = json.loads(line, object_pairs_hook=_unique_json_object)
                     except json.JSONDecodeError:
                         logger.warning("SGLang stream: skipping non-JSON line")
                         continue
 
-                    _raise_for_sglang_event_error(event, grammar=grammar)
+                    _raise_for_sglang_event_error(event, grammar=grammar, grammar_backend=self._grammar_backend)
                     chunk = _chunk_from_sglang_event(
                         event,
                         previous_cumulative_text=last_cumulative_text,
