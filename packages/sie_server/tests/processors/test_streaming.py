@@ -3999,3 +3999,30 @@ async def test_terminal_image_usage_counts_executed_images_only(
     else:
         assert "images" not in usage
     assert all("images" not in chunk.get("usage", {}) for chunk in chunks if not chunk.get("done"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("emit_terminal", [False, True])
+async def test_image_generation_without_token_counts_does_not_synthesize_usage(
+    monkeypatch: pytest.MonkeyPatch, emit_terminal: bool
+) -> None:
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = "rendered prompt"
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", AsyncMock(return_value=tokenizer))
+    script = [GenerationChunk(text_delta="ok", is_first=True)]
+    if emit_terminal:
+        script.append(GenerationChunk(text_delta="", done=True, finish_reason="stop"))
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=_make_registry(_FakeGenAdapter(script)), worker_id="w1")
+    wi = _make_work_item(
+        generate={
+            "messages": [{"role": "user", "content": "describe", "images": [{"data": b"image", "format": "png"}]}],
+            "max_new_tokens": 8,
+        }
+    )
+
+    await proc.process(_make_msg(wi), "test/model")
+
+    terminal = _terminal_chunk(nc)
+    assert terminal["done"] is True
+    assert "usage" not in terminal
