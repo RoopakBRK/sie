@@ -1358,14 +1358,14 @@ fn inject_inference_response_headers(paths: &mut serde_json::Map<String, Value>)
     let queue_success_headers = json!({
         "X-SIE-Version": header("Gateway package version that handled the request"),
         "X-SIE-Server-Version": header("Gateway-compatible server version advertised by this gateway"),
-        "X-SIE-Model-Revision": header(
-            "Immutable deployed bundle/config execution revision that handled the request, when available",
+        "X-SIE-Model-Revision": sha256_header(
+            "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
         ),
         "X-SIE-Execution-Identity-SHA256": sha256_header(
-            "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+            "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
         ),
         "X-SIE-Execution-Binding-SHA256": sha256_header(
-            "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+            "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
         ),
         "X-SIE-Request-Id": header("Gateway request id for queue-backed inference"),
         "X-SIE-Worker": header("Logical queue worker tag that produced the response"),
@@ -2029,6 +2029,18 @@ pub struct GenerateChunk {
     pub logprobs: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<GenerateChunkError>,
+    /// Worker-origin execution identity, only on a successful terminal event.
+    /// Optional complete pair with execution_binding_sha256; older or
+    /// self-hosted deployments may omit both. Not a catalog weights revision
+    /// or the executed bundle/config hash.
+    #[schema(pattern = "^[0-9a-f]{64}$", nullable = false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_identity_sha256: Option<String>,
+    /// Worker-origin execution binding, only on a successful terminal event
+    /// together with execution_identity_sha256. Both are lowercase SHA-256 digests.
+    #[schema(pattern = "^[0-9a-f]{64}$", nullable = false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding_sha256: Option<String>,
 }
 
 // ── /v1/chat/completions schemas ──────────────────────────────────
@@ -3507,6 +3519,19 @@ mod tests {
             chunk["properties"]["error"]["oneOf"][1]["$ref"],
             "#/components/schemas/GenerateChunkError"
         );
+        for field in ["execution_identity_sha256", "execution_binding_sha256"] {
+            assert_eq!(chunk["properties"][field]["pattern"], "^[0-9a-f]{64}$");
+            assert!(!chunk["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field)));
+        }
+        let revision = &spec["paths"]["/v1/generate/{model}"]["post"]["responses"]["200"]
+            ["headers"]["X-SIE-Model-Revision"];
+        assert_eq!(revision["schema"]["pattern"], "^[0-9a-f]{64}$");
+        let description = revision["description"].as_str().unwrap();
+        assert!(description.contains("catalog weights revision"));
+        assert!(description.contains("always omitted on SSE"));
         let chunk_error = &spec["components"]["schemas"]["GenerateChunkError"];
         assert_eq!(
             chunk_error["properties"]["param"]["type"],

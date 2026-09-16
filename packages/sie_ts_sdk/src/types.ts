@@ -1416,6 +1416,14 @@ export interface GenerateChunk {
   usage?: ChatUsage;
   /** Time-to-first-token, milliseconds. Terminal chunk only. */
   ttft_ms?: number;
+  /**
+   * Worker-origin execution identity, only on a successful terminal chunk.
+   * Optional complete pair with execution_binding_sha256; both are lowercase
+   * 64-hex SHA-256 digests. Older or self-hosted deployments may omit both.
+   */
+  execution_identity_sha256?: string;
+  /** Worker-origin execution binding, with the same terminal complete-pair contract. */
+  execution_binding_sha256?: string;
   /** Populated when the worker / gateway errored mid-stream. */
   error?: GenerationChunkError;
 }

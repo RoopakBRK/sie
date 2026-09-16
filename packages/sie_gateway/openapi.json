@@ -1519,6 +1519,16 @@
               }
             ]
           },
+          "execution_binding_sha256": {
+            "description": "Worker-origin execution binding, only on a successful terminal event\ntogether with execution_identity_sha256. Both are lowercase SHA-256 digests.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "execution_identity_sha256": {
+            "description": "Worker-origin execution identity, only on a successful terminal event.\nOptional complete pair with execution_binding_sha256; older or\nself-hosted deployments may omit both. Not a catalog weights revision\nor the executed bundle/config hash.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
           "finish_reason": {
             "type": [
               "string",
@@ -4158,22 +4168,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
@@ -4454,22 +4465,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
@@ -4659,22 +4671,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
@@ -5250,22 +5263,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
@@ -5595,22 +5609,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
@@ -5941,22 +5956,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
@@ -6266,22 +6282,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
@@ -7254,22 +7271,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
@@ -7544,22 +7562,23 @@
                 }
               },
               "X-SIE-Execution-Binding-SHA256": {
-                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+                "description": "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Execution-Identity-SHA256": {
-                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+                "description": "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
                 "schema": {
                   "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },
               "X-SIE-Model-Revision": {
-                "description": "Immutable deployed bundle/config execution revision that handled the request, when available",
+                "description": "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
                 "schema": {
+                  "pattern": "^[0-9a-f]{64}$",
                   "type": "string"
                 }
               },

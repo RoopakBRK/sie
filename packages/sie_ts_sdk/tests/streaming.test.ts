@@ -573,6 +573,37 @@ describe("SIEClient.streamGenerate", () => {
     expect(last?.ttft_ms).toBe(123.4);
   });
 
+  it.each([false, true])(
+    "preserves optional terminal execution evidence (%s)",
+    async (withEvidence) => {
+      const evidence: Partial<GenerateChunk> = withEvidence
+        ? { execution_identity_sha256: "a".repeat(64), execution_binding_sha256: "b".repeat(64) }
+        : {};
+      mockFetch.mockResolvedValueOnce(
+        sseResponse([
+          generateChunk(0, "Hello"),
+          generateChunk(1, "", { done: true, finish_reason: "stop", ...evidence }),
+        ]),
+      );
+      const client = new SIEClient("http://localhost:8080");
+      const chunks: GenerateChunk[] = [];
+      for await (const chunk of client.streamGenerate("org/model", "hi", { maxNewTokens: 8 })) {
+        chunks.push(chunk);
+      }
+      expect(chunks[0]).not.toHaveProperty("execution_identity_sha256");
+      expect(chunks[0]).not.toHaveProperty("execution_binding_sha256");
+      const terminal = chunks[1];
+      expect(terminal?.done).toBe(true);
+      if (withEvidence) {
+        expect(terminal?.execution_identity_sha256).toBe(evidence.execution_identity_sha256);
+        expect(terminal?.execution_binding_sha256).toBe(evidence.execution_binding_sha256);
+      } else {
+        expect(terminal).not.toHaveProperty("execution_identity_sha256");
+        expect(terminal).not.toHaveProperty("execution_binding_sha256");
+      }
+    },
+  );
+
   it("throws SIEStreamError when chunk.error is present", async () => {
     mockFetch.mockResolvedValueOnce(
       sseResponse([
