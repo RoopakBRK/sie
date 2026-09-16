@@ -34,7 +34,7 @@ import threading
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 
@@ -1909,7 +1909,7 @@ def _chunk_from_sglang_event(
                 chunk_logprobs = tuple(built)
 
     if is_terminal:
-        finish_reason = cast("FinishReason", raw_finish)
+        finish_reason = cast("Literal['stop', 'length']", raw_finish)
         prompt_tokens = meta.get("prompt_tokens") if isinstance(meta, dict) else None
         completion_tokens = meta.get("completion_tokens") if isinstance(meta, dict) else None
         return GenerationChunk(
@@ -1997,7 +1997,7 @@ def _parse_sglang_generate_response(result: Any) -> GenerationResult:
     raw_finish = meta.get("finish_reason")
     if isinstance(raw_finish, dict):
         raw_finish = raw_finish.get("type")
-    finish_reason = cast("FinishReason", raw_finish)
+    finish_reason = cast("Literal['stop', 'length']", raw_finish)
 
     return GenerationResult(
         text=text,
