@@ -14634,10 +14634,10 @@ mod tests {
 
         async fn publish_generate_streaming_sse(
             &self,
-            _target: PublishTarget,
-            _display_model: &str,
+            target: PublishTarget,
+            display_model: &str,
             _engine: &str,
-            _bundle_config_hash: &str,
+            bundle_config_hash: &str,
             _params: &WorkParams,
             _admission_pool: &str,
         ) -> Result<
@@ -14649,7 +14649,39 @@ mod tests {
             ),
             String,
         > {
-            unreachable!("bounded target proof uses non-streaming requests")
+            self.targets
+                .lock()
+                .expect("target probe lock")
+                .push((display_model.to_string(), target));
+            let (tx, rx) = oneshot::channel();
+            let mut collector = crate::queue::streaming::StreamCollector::new(
+                tx,
+                display_model.to_string(),
+                "default".to_string(),
+            );
+            let tap = collector.install_chunk_tap();
+            let terminal = serde_json::from_value(json!({
+                "kind": "chunk", "request_id": "request-1", "attempt_id": "attempt-1",
+                "seq": 0, "text_delta": "ok", "done": true, "is_first": true,
+                "finish_reason": "stop",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "executed_bundle_config_hash": bundle_config_hash,
+                "execution_identity_sha256": "c".repeat(64),
+                "execution_binding_sha256": "d".repeat(64)
+            }))
+            .unwrap();
+            assert_eq!(
+                collector.apply(terminal),
+                crate::queue::streaming::ChunkApplied::Terminal
+            );
+            let outcome = collector.build_outcome().unwrap();
+            collector.sender.take().unwrap().send(outcome).unwrap();
+            Ok((
+                "request-1".to_string(),
+                rx,
+                tap,
+                DispatchDurability::accepted(),
+            ))
         }
 
         async fn publish_cancel(&self, _request_id: &str) {}
@@ -15070,6 +15102,78 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_generation_target(probe.take_target(), "org/h", "org/h", "h100");
         }
+    }
+
+    #[tokio::test]
+    async fn native_sse_revision_contract_distinguishes_catalog_and_execution_evidence() {
+        let (state, _) = mixed_governed_generation_state(false).await;
+        let weights_revision = "0123456789abcdef0123456789abcdef01234567";
+        state
+            .model_registry
+            .add_model_config(
+                serde_json::from_value(json!({
+                    "sie_id": "org/g",
+                    "hf_revision": weights_revision,
+                    "profiles": {"default": {
+                        "adapter_path": "sie_server.adapters.sentence_transformer:Adapter",
+                        "max_batch_tokens": 4096
+                    }}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let (execution_hash, catalog_revision, _) = state
+            .model_registry
+            .bundle_execution_evidence("default", "default", "org/g");
+        assert_eq!(catalog_revision.as_deref(), Some(weights_revision));
+        assert_eq!(execution_hash.len(), 64);
+        assert_ne!(execution_hash, weights_revision);
+        let mut worker = worker_msg("default", "l4", "default");
+        worker.bundle_config_hash = execution_hash;
+        state
+            .registry
+            .update_worker("http://worker-l4:8080", worker)
+            .await;
+
+        let response = proxy_request(
+            State(state),
+            json_request(
+                "/v1/generate/org%2Fg",
+                json!({
+                    "prompt": "hello", "max_new_tokens": 4, "stream": true
+                }),
+            ),
+            "generate",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        for header in [
+            "x-sie-model-revision",
+            "x-sie-execution-identity-sha256",
+            "x-sie-execution-binding-sha256",
+        ] {
+            assert!(!response.headers().contains_key(header));
+        }
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), 16384),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        let terminal = events.iter().find(|event| event["done"] == true).unwrap();
+        assert_eq!(terminal["execution_identity_sha256"], "c".repeat(64));
+        assert_eq!(terminal["execution_binding_sha256"], "d".repeat(64));
+        assert!(body.contains("data: [DONE]"));
+        assert!(!body.contains(weights_revision));
     }
 
     #[tokio::test]

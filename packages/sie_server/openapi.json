@@ -3052,6 +3052,44 @@
       },
       "GenerateChunk": {
         "description": "One SIE-native Server-Sent Event from a streaming generate request.",
+        "oneOf": [
+          {
+            "properties": {
+              "done": {
+                "const": true
+              },
+              "error": {
+                "type": "null"
+              },
+              "execution_identity_sha256": {
+                "type": "string"
+              },
+              "execution_binding_sha256": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "execution_identity_sha256",
+              "execution_binding_sha256"
+            ]
+          },
+          {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "execution_identity_sha256"
+                  ]
+                },
+                {
+                  "required": [
+                    "execution_binding_sha256"
+                  ]
+                }
+              ]
+            }
+          }
+        ],
         "properties": {
           "request_id": {
             "description": "Request id shared by every event in the stream",
@@ -3141,6 +3179,34 @@
             ],
             "default": null,
             "description": "Terminal generation error"
+          },
+          "execution_identity_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional worker-origin execution identity, only on a successful terminal event together with execution_binding_sha256. Older or self-hosted deployments may omit both. Distinct from the catalog weights revision and executed bundle/config hash.",
+            "title": "Execution Identity Sha256"
+          },
+          "execution_binding_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional worker-origin execution binding, with the same successful-terminal complete-pair contract",
+            "title": "Execution Binding Sha256"
           }
         },
         "required": [

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sie_sdk import SIEAsyncClient
 from sie_sdk.client.errors import RequestError, ResourceExhaustedError, ServerError
+from sie_sdk.types import GenerateChunk
 
 
 class _FakeRaw:
@@ -230,6 +231,38 @@ async def test_async_stream_generate_yields_and_normalizes_path() -> None:
         "logprobs": True,
     }
     await client.close()
+
+
+@pytest.mark.parametrize("with_evidence", [False, True])
+@pytest.mark.asyncio
+async def test_stream_generate_preserves_optional_terminal_execution_evidence(with_evidence: bool) -> None:
+    terminal: GenerateChunk = {
+        "request_id": "request-1",
+        "seq": 1,
+        "text_delta": "",
+        "done": True,
+        "finish_reason": "stop",
+    }
+    if with_evidence:
+        terminal.update(execution_identity_sha256="a" * 64, execution_binding_sha256="b" * 64)
+    delta = {"request_id": "request-1", "seq": 0, "text_delta": "Hello", "done": False}
+    client = SIEAsyncClient("http://localhost:8080")
+    _patch_session(client, post_returns=_FakeRaw(line_bytes=_sse_bytes(delta, dict(terminal))))
+    try:
+        chunks: list[GenerateChunk] = [
+            chunk async for chunk in client.stream_generate("org/model", "hi", max_new_tokens=8)
+        ]
+    finally:
+        await client.close()
+    assert chunks[-1] == terminal
+    assert "execution_identity_sha256" not in chunks[0]
+    assert "execution_binding_sha256" not in chunks[0]
+    if with_evidence:
+        assert chunks[-1]["execution_identity_sha256"] == "a" * 64
+        assert chunks[-1]["execution_binding_sha256"] == "b" * 64
+    else:
+        assert "execution_identity_sha256" not in chunks[-1]
+        assert "execution_binding_sha256" not in chunks[-1]
 
 
 @pytest.mark.asyncio

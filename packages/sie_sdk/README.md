@@ -49,6 +49,23 @@ client = SIEClient(
 )
 ```
 
+## Generation execution evidence
+
+`SIEClient.last_model_revision` retains the `X-SIE-Model-Revision` response
+header from the latest call in the current thread. On buffered gateway
+responses, this is the lowercase 64-hex executed bundle/config SHA-256 when
+worker evidence matches the routing snapshot. It is distinct from a catalog
+weights revision such as a 40-hex Hugging Face commit.
+
+Gateway SSE responses omit that header: headers are sent before terminal
+execution evidence is available. Fully consuming `stream_generate()` leaves
+`last_model_revision` as `None`. A successful terminal `GenerateChunk` may
+instead carry `execution_identity_sha256` and `execution_binding_sha256` as
+an optional complete pair of lowercase 64-hex SHA-256 digests. Both Python
+clients preserve those fields. Older or self-hosted deployments may omit
+both; absence is compatible, but cannot prove which deployment executed.
+The terminal digests are distinct from the weights revision and config hash.
+
 ## Object storage and model caches
 
 Install the `storage` extra to use `s3://`, `gs://`, `abfs(s)://`, or native

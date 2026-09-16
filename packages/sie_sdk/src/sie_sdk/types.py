@@ -659,6 +659,12 @@ class GenerateChunk(TypedDict, total=False):
         finish_reason: Termination reason (terminal chunk only).
         usage: Prompt / completion / total token counts (terminal chunk only).
         ttft_ms: Time-to-first-token in milliseconds (terminal chunk only).
+        execution_identity_sha256: Optional worker-origin execution identity.
+            Present only on a successful terminal chunk, together with
+            ``execution_binding_sha256``; both are lowercase 64-hex SHA-256
+            digests. Absence is valid for older or self-hosted deployments.
+        execution_binding_sha256: Optional worker-origin execution binding,
+            with the same successful-terminal, complete-pair contract.
         error: ``{code, message, param?, retry_after_s?}`` when generation
             failed mid-stream. ``retry_after_s`` is meaningful only for
             ``RESOURCE_EXHAUSTED``.
@@ -672,6 +678,8 @@ class GenerateChunk(TypedDict, total=False):
     finish_reason: FinishReason
     usage: GenerationUsage
     ttft_ms: float
+    execution_identity_sha256: str
+    execution_binding_sha256: str
     error: GenerateChunkError
 
 
