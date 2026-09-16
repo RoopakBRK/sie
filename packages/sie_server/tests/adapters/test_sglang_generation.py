@@ -1885,6 +1885,17 @@ def test_generate_n_gt_one_non_streaming_omits_logprobs_when_not_requested(
             },
         },
     ]
+    sglang_results.append(
+        {
+            "text": "b",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "completion_tokens": 1,
+                "prompt_tokens": 3,
+                "output_token_logprobs": [[-1.0, 2, "b"]],
+            },
+        }
+    )
     resp = MagicMock()
     resp.json = MagicMock(return_value=sglang_results)
     resp.raise_for_status = MagicMock()
@@ -2431,3 +2442,58 @@ def test_chunk_translator_rejects_malformed_nonnull_finish_metadata(finish: Any)
             previous_cumulative_text="",
             first_yield_done=False,
         )
+
+
+@pytest.mark.parametrize("indexes", [[], [0], [0, 0], [0, 2], [0, True], [0, "1"]])
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_streaming_candidates_require_exact_distinct_terminals(mock_async_client: MagicMock, adapter, indexes) -> None:
+    events = [
+        {
+            "index": index,
+            "text": "value",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 4,
+                "completion_tokens": 1,
+            },
+        }
+        for index in indexes
+    ]
+    mock_async_client.return_value = _make_client_with_stream(
+        _FakeStreamingResponse([*("data: " + json.dumps(event) for event in events), "data: [DONE]"])
+    )
+    adapter._server_url = "http://localhost:30005"
+    chunks = []
+
+    async def consume() -> None:
+        async for chunk in adapter.generate(prompt="Two values", max_new_tokens=8, n=2, stream=True):
+            chunks.append(chunk)
+
+    with pytest.raises(GenerationError):
+        asyncio.run(consume())
+    assert not any(chunk.done for chunk in chunks)
+    assert all(chunk.prompt_tokens is None and chunk.completion_tokens is None for chunk in chunks)
+
+
+@pytest.mark.parametrize(("count", "n", "best_of"), [(0, 2, None), (1, 2, None), (3, 2, None), (2, 1, 3)])
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_buffered_candidates_require_exact_count_before_ranking(
+    mock_async_client: MagicMock, adapter, count: int, n: int, best_of: int | None
+) -> None:
+    response = MagicMock()
+    response.json.return_value = [
+        {"text": "value", "meta_info": {"finish_reason": {"type": "stop"}}} for _ in range(count)
+    ]
+    client = _make_client_with_stream(_FakeStreamingResponse([]))
+    client.post = AsyncMock(return_value=response)
+    mock_async_client.return_value = client
+    adapter._server_url = "http://localhost:30005"
+    chunks = []
+
+    async def consume() -> None:
+        async for chunk in adapter.generate(prompt="Two values", max_new_tokens=8, n=n, best_of=best_of):
+            chunks.append(chunk)
+
+    with pytest.raises(GenerationError, match="incorrect candidate count"):
+        asyncio.run(consume())
+    assert chunks == []

@@ -1247,6 +1247,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                     sbody["top_logprobs_num"] = top_logprobs
             sclient = await self._get_or_create_http_client()
             last_text: dict[int, str] = {}
+            completed_candidates: set[int] = set()
             # Per-candidate logprob watermark: SGLang's
             # ``meta_info.output_token_logprobs`` is a per-candidate cumulative
             # list growing across events for that index. Slicing
@@ -1272,7 +1273,11 @@ class SGLangGenerationAdapter(GenerationAdapter):
                         except json.JSONDecodeError:
                             continue
                         _raise_for_sglang_event_error(event, grammar=grammar)
-                        idx = int(event.get("index", 0))
+                        idx = event.get("index", 0)
+                        if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < return_count:
+                            raise GenerationError("SGLang /generate returned an invalid candidate index")
+                        if idx in completed_candidates:
+                            raise GenerationError("SGLang /generate returned an event after the candidate terminal")
                         cumulative = event.get("text", "")
                         if not isinstance(cumulative, str):
                             cumulative = last_text.get(idx, "")
@@ -1284,6 +1289,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
                         fr = meta.get("finish_reason")
                         fr_type = fr.get("type") if isinstance(fr, dict) else fr
                         candidate_done = fr_type is not None
+                        if candidate_done:
+                            completed_candidates.add(idx)
                         if candidate_done and isinstance(meta.get("completion_tokens"), int):
                             total_completion += meta["completion_tokens"]
                         # Per-candidate logprob slice — same shape conversion as the
@@ -1346,6 +1353,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
                             choice_index=idx,
                             logprobs=chunk_logprobs,
                         )
+                if len(completed_candidates) != return_count:
+                    raise GenerationError("SGLang /generate ended before all candidates completed")
                 # Single global terminal closes the multi-candidate stream (carries
                 # aggregate usage). Each candidate already received its own
                 # ``finish_reason`` on the per-choice completion chunk above; this
@@ -1392,8 +1401,12 @@ class SGLangGenerationAdapter(GenerationAdapter):
             # tolerate a single dict defensively.
             if isinstance(results, dict):
                 results = [results]
+            if not isinstance(results, list):
+                raise GenerationError("SGLang /generate returned an invalid candidate list")
             for result in results:
                 _raise_for_sglang_event_error(result, grammar=grammar, terminal=True)
+            if len(results) != gen_count:
+                raise GenerationError("SGLang /generate returned an incorrect candidate count")
             if rank:
                 # Highest cumulative token-logprob first; keep the top return_count.
                 results = sorted(results, key=_cumulative_logprob, reverse=True)[:return_count]
