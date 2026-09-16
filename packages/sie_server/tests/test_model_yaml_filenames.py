@@ -63,3 +63,37 @@ def test_instruction_template_has_placeholder(yaml_path: Path) -> None:
         f"callers drop the per-task instruction. Use 'Instruct: {{instruction}}' + "
         f"'default_instruction'."
     )
+
+
+_GREEDY_ONLY_ADAPTERS = frozenset({"sie_server.adapters.ctranslate2.generation:CTranslate2GenerationAdapter"})
+
+
+@pytest.mark.parametrize("yaml_path", sorted(MODELS_DIR.glob("*.yaml")), ids=lambda p: p.name)
+def test_greedy_only_backend_declares_greedy_default_sampling(yaml_path: Path) -> None:
+    """A profile served by a greedy-only backend must pin ``default_sampling.temperature`` to 0.
+
+    ``/v1/generate`` fills ``temperature=1.0`` for a request that omits it unless the
+    profile declares its own sampling default, and the CTranslate2 adapter rejects any
+    non-greedy request, so without the declaration every customer request that leaves
+    the sampler at its default is refused with a 400.
+    """
+    with yaml_path.open() as f:
+        config = yaml.safe_load(f) or {}
+    profiles = config.get("profiles")
+    if not isinstance(profiles, dict):
+        return
+    offenders: list[str] = []
+    for profile_name, profile in profiles.items():
+        if not isinstance(profile, dict) or profile.get("adapter_path") not in _GREEDY_ONLY_ADAPTERS:
+            continue
+        adapter_options = profile.get("adapter_options")
+        runtime = adapter_options.get("runtime") if isinstance(adapter_options, dict) else None
+        sampling = runtime.get("default_sampling") if isinstance(runtime, dict) else None
+        temperature = sampling.get("temperature") if isinstance(sampling, dict) else None
+        if not isinstance(temperature, int | float) or isinstance(temperature, bool) or float(temperature) != 0.0:
+            offenders.append(profile_name)
+    assert not offenders, (
+        f"{yaml_path.name}: profile(s) {offenders} use a greedy-only generation backend "
+        f"without 'adapter_options.runtime.default_sampling.temperature: 0.0'; a request "
+        f"that omits temperature resolves to 1.0 and the backend refuses it."
+    )
