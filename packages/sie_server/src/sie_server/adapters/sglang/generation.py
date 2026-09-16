@@ -1085,13 +1085,6 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # verdict from the multi-candidate path. Inert for non-guard models.
         if self._guard and ((n is not None and n > 1) or (best_of is not None and best_of > 1)):
             raise ValueError("guard models support single-candidate generation only (n=1, best_of<=1)")
-        # Whether the CLIENT asked for logprobs, captured before the guard
-        # forcing below. Guard models force logprobs on internally to compute
-        # the verdict threshold; those forced logprobs are an implementation
-        # detail and MUST NOT leak to a client that did not request them
-        # (GenerationChunk.logprobs contract). The streaming guard intercept
-        # uses this to decide whether to strip the forced logprobs.
-        client_requested_logprobs = logprobs
         # Thresholding needs the verdict-token distribution — force logprobs on
         # even if the caller didn't ask. Only affects the n=1 path below.
         if self._guard:
@@ -1604,14 +1597,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                             verdict = _thresholded_verdict(guard_lp_buffer, self._guard)
                             if verdict is not None:
                                 guard_resolved = True
-                                if client_requested_logprobs:
-                                    v_idx = _verdict_position(tuple(guard_lp_buffer))
-                                    remaining = tuple(e for i, e in enumerate(guard_lp_buffer) if i != v_idx) or None
-                                else:
-                                    remaining = None
-                                chunk = dataclasses.replace(
-                                    chunk, text_delta=verdict, is_first=True, logprobs=remaining
-                                )
+                                chunk = dataclasses.replace(chunk, text_delta=verdict, is_first=True, logprobs=None)
                             elif chunk.done:
                                 chunk = dataclasses.replace(
                                     chunk,
@@ -1718,19 +1704,6 @@ def _p_unsafe_from_entry(entry: Any) -> float | None:
     ey = math.exp(lp_yes - offset) if lp_yes is not None else 0.0
     en = math.exp(lp_no - offset) if lp_no is not None else 0.0
     return ey / (ey + en) if (ey + en) > 0 else None
-
-
-def _verdict_position(chunk_logprobs: Any, scan_positions: int = _GUARD_VERDICT_SCAN_POSITIONS) -> int | None:
-    """Index of the first position (within ``scan_positions``) carrying a verdict
-    distribution, or ``None``. The consumed/rewritten verdict entry the streaming
-    intercept drops from client-requested logprobs.
-    """
-    if not chunk_logprobs:
-        return None
-    for idx, entry in enumerate(chunk_logprobs[:scan_positions]):
-        if _p_unsafe_from_entry(entry) is not None:
-            return idx
-    return None
 
 
 def _p_unsafe_from_verdict_logprobs(

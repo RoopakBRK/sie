@@ -2233,10 +2233,8 @@ def test_guard_no_client_logprobs_strips_forced_logprobs_on_error(mock_async_cli
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
-def test_guard_client_logprobs_preserved_minus_verdict_entry(mock_async_client: MagicMock) -> None:
-    """M4: client DID request logprobs → logprobs preserved, minus the consumed
-    verdict entry (the position that produced the verdict).
-    """
+def test_guard_client_logprobs_omitted_for_rewritten_verdict(mock_async_client: MagicMock) -> None:
+    """Rewritten verdicts cannot expose logprobs for discarded tokens."""
     # Position 0: leading whitespace (no verdict). Position 1: the "Yes" verdict.
     # Both arrive in one event so the buffer holds two entries at resolution; the
     # consumed verdict entry (position 1) is dropped, the whitespace entry kept.
@@ -2253,10 +2251,7 @@ def test_guard_client_logprobs_preserved_minus_verdict_entry(mock_async_client: 
     chunks = _drive_guard(_guard_adapter(), sse_lines, logprobs=True, top_logprobs=20)
     verdict_chunk = next(c for c in chunks if c.text_delta)
     assert verdict_chunk.text_delta == "Yes"
-    # The consumed verdict entry (position 1) is dropped; the leading whitespace
-    # entry remains so callers still get the surrounding token metadata.
-    assert verdict_chunk.logprobs is not None
-    assert [e["token"] for e in verdict_chunk.logprobs] == [" "]
+    assert verdict_chunk.logprobs is None
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
@@ -2538,8 +2533,9 @@ def test_guard_eos_with_verdict_alternatives_is_not_a_verdict(mock_async_client:
     assert chunks[-1].text_delta == ""
 
 
+@pytest.mark.parametrize("combined", [False, True])
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
-def test_guard_tail_cannot_change_thresholded_verdict(mock_async_client: MagicMock) -> None:
+def test_guard_tail_cannot_change_thresholded_verdict(mock_async_client: MagicMock, combined: bool) -> None:
     lines = [
         _guard_event("Yes", [_sglang_token("Yes", -0.1)], [_guard_top(yes=-0.1, no=-3)]),
         _guard_event(
@@ -2549,8 +2545,11 @@ def test_guard_tail_cannot_change_thresholded_verdict(mock_async_client: MagicMo
             terminal=True,
         ),
     ]
+    if combined:
+        lines = lines[-1:]
     mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(lines))
-    chunks = _drive_guard(_guard_adapter(), lines)
+    chunks = _drive_guard(_guard_adapter(), lines, logprobs=True, top_logprobs=20)
+    assert all(chunk.logprobs is None for chunk in chunks)
     assert "".join(c.text_delta for c in chunks) == "Yes"
     assert chunks[-1].done
     assert chunks[-1].completion_tokens == 2
