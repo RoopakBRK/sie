@@ -4110,7 +4110,7 @@ async def test_known_type_refusal_is_identical_for_preflight_leader_and_follower
     messages = [_make_msg(_make_work_item()) for _ in range(2)]
 
     def wait_for(awaitable, *, timeout):
-        if any(awaitable is future for future in proc._grammar_inflight.values()):
+        if timeout == streaming_mod._GRAMMAR_FOLLOWER_TIMEOUT_S:
             following.set()
         return real_wait_for(awaitable, timeout=timeout)
 
@@ -4174,3 +4174,88 @@ async def test_backend_type_refusal_survives_worker_terminal_and_settlement(monk
     assert terminal.get("usage") is None
     message.ack.assert_awaited_once()
     assert adapter.close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["cancel", "timeout"])
+@pytest.mark.parametrize("refusal", [False, True])
+async def test_grammar_follower_interruption_preserves_shared_compile(monkeypatch, interruption, refusal) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    following = asyncio.Event()
+    real_wait_for = streaming_mod._wait_for
+    nc = AsyncMock()
+    registry = _make_registry(_FakeGenAdapter([]))
+    registry.get_config.side_effect = KeyError("no config")
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    grammar = GrammarSpec(kind="json_schema", value={"type": ["string", "null"]})
+    messages = [_make_msg(_make_work_item()) for _ in range(3)]
+
+    async def tokenizer(_):
+        started.set()
+        await release.wait()
+        return object()
+
+    def compile_result(*_):
+        if refusal:
+            raise GrammarValidationError(OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, code="invalid_request", param="grammar")
+        return True
+
+    calls = _patch_compile(monkeypatch, compile_result)
+    monkeypatch.setattr(proc, "_get_tokenizer", tokenizer)
+
+    def wait_for(awaitable, *, timeout):
+        if timeout == streaming_mod._GRAMMAR_FOLLOWER_TIMEOUT_S:
+            following.set()
+            if interruption == "timeout" and asyncio.current_task() is interrupted:
+                timeout = 0
+        return real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(streaming_mod, "_wait_for", wait_for)
+
+    async def run(index):
+        return await proc._ensure_grammar_ready(
+            grammar,
+            model_id="test/model",
+            reply_subject="_INBOX.test",
+            request_id=f"req-{index}",
+            attempt_id=f"att-{index}",
+            msg=messages[index],
+        )
+
+    leader = asyncio.create_task(run(0))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        interrupted = asyncio.create_task(run(1))
+        await asyncio.wait_for(following.wait(), timeout=3)
+        following.clear()
+        remaining = asyncio.create_task(run(2))
+        await asyncio.wait_for(following.wait(), timeout=3)
+        if interruption == "cancel":
+            interrupted.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await interrupted
+            messages[1].ack.assert_not_awaited()
+            messages[1].nak.assert_not_awaited()
+            assert all(chunk["request_id"] != "req-1" for chunk in _decode_chunks(nc))
+        else:
+            assert await asyncio.wait_for(interrupted, timeout=3) is False
+            messages[1].ack.assert_awaited_once()
+            timed_out = [chunk for chunk in _decode_chunks(nc) if chunk["request_id"] == "req-1"]
+            assert len(timed_out) == 1
+            assert timed_out[0]["error"]["code"] == "grammar_compile_failed"
+            assert timed_out[0].get("usage") is None
+        shared = next(iter(proc._grammar_inflight.values()))
+        assert not shared.done()
+    finally:
+        release.set()
+    assert await asyncio.gather(leader, remaining) == [not refusal, not refusal]
+    assert len(calls) == 1
+    assert proc._grammar_inflight == {}
+    if refusal:
+        for message in (messages[0], messages[2]):
+            message.ack.assert_awaited_once()
+        terminals = _decode_chunks(nc)
+        kept = [chunk for chunk in terminals if chunk["request_id"] in {"req-0", "req-2"}]
+        assert len(kept) == 2
+        assert all(chunk["error"]["code"] == "invalid_request" and chunk.get("usage") is None for chunk in kept)

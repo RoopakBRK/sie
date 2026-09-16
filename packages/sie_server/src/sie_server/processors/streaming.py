@@ -3636,7 +3636,7 @@ class StreamingProcessor:
                 # load, so a generous ceiling here still guarantees the
                 # follower settles its own work item rather than hanging
                 # until ack_wait and triggering redelivery.
-                await _wait_for(future_to_await, timeout=_GRAMMAR_FOLLOWER_TIMEOUT_S)
+                await _wait_for(asyncio.shield(future_to_await), timeout=_GRAMMAR_FOLLOWER_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001
                 # Leader's compile failed, was cancelled, or did not
                 # resolve in time; surface the same terminal-error path.

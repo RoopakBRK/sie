@@ -2849,3 +2849,27 @@ async def test_encoded_http_error_is_not_read_or_decompressed(adapter, encoding,
             ):
                 raise AssertionError("error response must not yield a generation chunk")
     assert closed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("n", "stream", "best_of"), [(1, False, None), (2, True, None), (2, False, None), (1, False, 2)]
+)
+async def test_duplicate_event_keys_raise_typed_error_before_output(adapter, n, stream, best_of) -> None:
+    payload = '{"text":"secret","text":"[]","meta_info":{"finish_reason":{"type":"stop"},"prompt_tokens":1,"completion_tokens":1}}'
+
+    def respond(request):
+        body = json.loads(request.content)
+        content = "data: " + payload + "\n\n" if body["stream"] else "[" + payload + "]"
+        return httpx.Response(200, text=content)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        adapter._http_client = client
+        adapter._server_url = "http://localhost:30005"
+        with pytest.raises(GenerationError, match="duplicate JSON keys") as error:
+            async for _ in adapter.generate(
+                prompt="Optional value", max_new_tokens=8, grammar=_TYPE_GRAMMAR, n=n, stream=stream, best_of=best_of
+            ):
+                raise AssertionError("duplicate keys must not yield text or usage")
+    assert error.value.code == "inference_error"
+    assert "secret" not in str(error.value)

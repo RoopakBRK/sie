@@ -170,7 +170,7 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("SGLang /generate returned duplicate JSON keys")
+            raise GenerationError("SGLang /generate returned duplicate JSON keys")
         result[key] = value
     return result
 
@@ -197,7 +197,7 @@ async def _raise_for_sglang_http_error(
         try:
             body = await asyncio.wait_for(read_error(), timeout=1.0)
             payload = json.loads(body, object_pairs_hook=_unique_json_object)
-        except (ValueError, RecursionError, httpx.HTTPError, TimeoutError):
+        except (ValueError, RecursionError, GenerationError, httpx.HTTPError, TimeoutError):
             pass
         else:
             if payload == {"error": {"message": _JSON_SCHEMA_TYPE_DIAGNOSTIC}}:
