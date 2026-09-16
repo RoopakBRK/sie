@@ -351,6 +351,9 @@ async def _parse_tool_call_stream_impl(
         return s
 
     async for chunk in chunks:
+        if not chunk.text_delta and not chunk.done and chunk.finish_reason is None and not chunk.logprobs:
+            yield chunk
+            continue
         idx = chunk.choice_index
         state = _state(idx)
         incoming = chunk.text_delta

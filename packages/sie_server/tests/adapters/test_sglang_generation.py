@@ -1952,8 +1952,7 @@ class TestGuardVerdictThreshold:
         assert _thresholded_verdict(lp, {"threshold": 0.5}) == "Yes"
         assert _thresholded_verdict(lp, {"threshold": 0.8}) == "No"
 
-    def test_no_threshold_or_no_logprobs_leaves_output(self) -> None:
-        # Missing/invalid threshold or absent verdict logprobs -> None (raw kept).
+    def test_no_threshold_or_no_logprobs_is_invalid(self) -> None:
         assert _thresholded_verdict(self._chunk_logprobs(-0.1, -2.0), {}) is None
         assert _thresholded_verdict((), {"threshold": 0.8}) is None
 
@@ -2167,10 +2166,8 @@ def test_guard_verdict_in_second_position_applies_threshold(mock_async_client: M
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
-def test_guard_no_verdict_in_scan_window_falls_back_to_raw(mock_async_client: MagicMock) -> None:
-    """H2 fallback: no Yes/No anywhere in the first N positions → the raw buffered
-    output is preserved (never dropped or hung).
-    """
+def test_guard_no_verdict_in_scan_window_fails_closed(mock_async_client: MagicMock) -> None:
+    """A missing verdict must never be returned as a successful guard result."""
     sse_lines = [
         _guard_event("a", [_sglang_token("a", -0.1)], [_guard_top(filler="a")]),
         _guard_event(
@@ -2188,9 +2185,10 @@ def test_guard_no_verdict_in_scan_window_falls_back_to_raw(mock_async_client: Ma
     ]
     mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
     chunks = _drive_guard(_guard_adapter(), sse_lines)
-    # Raw output preserved: the concatenated deltas reproduce the model output.
-    assert "".join(c.text_delta for c in chunks) == "abc"
-    assert any(c.done for c in chunks)
+    assert all(c.text_delta == "" for c in chunks)
+    assert chunks[-1].done
+    assert chunks[-1].finish_reason == "error"
+    assert chunks[-1].error_code == "invalid_guard_verdict"
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
@@ -2215,10 +2213,8 @@ def test_guard_no_client_logprobs_strips_forced_logprobs_on_success(mock_async_c
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
-def test_guard_no_client_logprobs_strips_forced_logprobs_on_fallback(mock_async_client: MagicMock) -> None:
-    """M4: on the fallback path (no verdict parsed) the forced logprobs are still
-    stripped when the client did not request them.
-    """
+def test_guard_no_client_logprobs_strips_forced_logprobs_on_error(mock_async_client: MagicMock) -> None:
+    """Unusable guard output exposes neither raw text nor forced logprobs."""
     sse_lines = [
         _guard_event("a", [_sglang_token("a", -0.1)], [_guard_top(filler="a")]),
         _guard_event(
@@ -2232,7 +2228,8 @@ def test_guard_no_client_logprobs_strips_forced_logprobs_on_fallback(mock_async_
     mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
     chunks = _drive_guard(_guard_adapter(), sse_lines)
     assert all(c.logprobs is None for c in chunks)
-    assert "".join(c.text_delta for c in chunks) == "ab"
+    assert "".join(c.text_delta for c in chunks) == ""
+    assert chunks[-1].error_code == "invalid_guard_verdict"
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
@@ -2497,3 +2494,86 @@ def test_buffered_candidates_require_exact_count_before_ranking(
     with pytest.raises(GenerationError, match="incorrect candidate count"):
         asyncio.run(consume())
     assert chunks == []
+
+
+@pytest.mark.parametrize("text", ["", "No", "Maybe"])
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_missing_verdict_distribution_is_typed_error(mock_async_client: MagicMock, text: str) -> None:
+    lines = [_guard_event(text, [_sglang_token(text, -0.1)], [], terminal=True), "data: [DONE]"]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(lines))
+    chunks = _drive_guard(_guard_adapter(), lines, logprobs=True)
+    assert len(chunks) == 1
+    terminal = chunks[0]
+    assert terminal.text_delta == ""
+    assert terminal.logprobs is None
+    assert terminal.finish_reason == "error"
+    assert terminal.error_code == "invalid_guard_verdict"
+    assert terminal.prompt_tokens == 5
+    assert terminal.completion_tokens == 1
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), 0.1, True, "-0.1"])
+def test_guard_invalid_verdict_probability_cannot_be_safe(invalid: Any) -> None:
+    logprobs = ({"token": "No", "top_logprobs": [_lp("Yes", invalid), _lp("No", -0.1)]},)
+    assert _thresholded_verdict(logprobs, {"threshold": 0.5}) is None
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), -0.1, 1.1, True, "0.5"])
+def test_guard_invalid_threshold_cannot_be_safe(threshold: Any) -> None:
+    logprobs = ({"token": "Yes", "top_logprobs": [_lp("Yes", -0.5), _lp("No", -0.5)]},)
+    assert _thresholded_verdict(logprobs, {"threshold": threshold}) is None
+
+
+def test_guard_very_small_probabilities_are_normalized_without_underflow() -> None:
+    logprobs = ({"token": "Yes", "top_logprobs": [_lp("Yes", -1000), _lp("No", -1001)]},)
+    assert _thresholded_verdict(logprobs, {"threshold": 0.5}) == "Yes"
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_eos_with_verdict_alternatives_is_not_a_verdict(mock_async_client: MagicMock) -> None:
+    lines = [_guard_event("", [_sglang_token("<|end_of_text|>", -0.1)], [_guard_top(yes=-4, no=-3)], terminal=True)]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(lines))
+    chunks = _drive_guard(_guard_adapter(), lines)
+    assert chunks[-1].error_code == "invalid_guard_verdict"
+    assert chunks[-1].text_delta == ""
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_tail_cannot_change_thresholded_verdict(mock_async_client: MagicMock) -> None:
+    lines = [
+        _guard_event("Yes", [_sglang_token("Yes", -0.1)], [_guard_top(yes=-0.1, no=-3)]),
+        _guard_event(
+            "Yes because",
+            [_sglang_token("Yes", -0.1), _sglang_token(" because", -0.2)],
+            [_guard_top(yes=-0.1, no=-3), _guard_top(filler=" because")],
+            terminal=True,
+        ),
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(lines))
+    chunks = _drive_guard(_guard_adapter(), lines)
+    assert "".join(c.text_delta for c in chunks) == "Yes"
+    assert chunks[-1].done
+    assert chunks[-1].completion_tokens == 2
+
+
+@pytest.mark.parametrize("invalid", [None, "-0.1", True, False, float("nan"), float("inf"), float("-inf"), 0.1])
+@pytest.mark.parametrize("position", ["sampled", "alternative"])
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_malformed_wire_probability_fails_closed(
+    mock_async_client: MagicMock, invalid: Any, position: str
+) -> None:
+    sampled = invalid if position == "sampled" else -0.1
+    alternative = invalid if position == "alternative" else -0.1
+    lines = [
+        _guard_event(
+            "No",
+            [_sglang_token("No", sampled)],
+            [[_sglang_token("Yes", alternative), _sglang_token("No", -0.1)]],
+            terminal=True,
+        )
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(lines))
+    chunks = _drive_guard(_guard_adapter(), lines)
+    assert chunks[-1].error_code == "invalid_guard_verdict"
+    assert chunks[-1].finish_reason == "error"
+    assert not any(c.text_delta for c in chunks)

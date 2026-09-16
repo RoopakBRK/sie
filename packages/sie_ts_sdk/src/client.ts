@@ -1270,6 +1270,11 @@ export class SIEClient {
    * the gateway aggregates, and the SDK returns the assembled result
    * plus SIE-native timing metadata (TTFT, TPOT, attempt id). To
    * consume chunks as they arrive, use {@link streamGenerate} instead.
+   * Text-only prompts are raw continuation input, passed unchanged without
+   * the model's chat template or its enable_thinking/guardian_config settings.
+   * Use {@link chatCompletions} with messages for chat, instruction-based
+   * structured output, and guard checks. Image-bearing native requests render
+   * the prompt and images as one user turn through the model's template.
    *
    * @example
    * ```typescript

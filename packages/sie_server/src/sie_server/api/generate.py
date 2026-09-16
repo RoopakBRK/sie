@@ -850,19 +850,18 @@ async def _stream_generate_events(
                     yield f"data: {json.dumps(event)}\n\n"
                     seq += 1
                 break
-            if chunk.text_delta or chunk.logprobs:
-                if chunk.text_delta and ttft_ms is None:
-                    ttft_ms = (time.perf_counter() - t0) * 1000.0
-                event: dict[str, Any] = {
-                    "request_id": request_id,
-                    "seq": seq,
-                    "text_delta": chunk.text_delta,
-                    "done": False,
-                }
-                if chunk.logprobs:
-                    event["logprobs"] = list(chunk.logprobs)
-                seq += 1
-                yield f"data: {json.dumps(event)}\n\n"
+            if chunk.text_delta and ttft_ms is None:
+                ttft_ms = (time.perf_counter() - t0) * 1000.0
+            event: dict[str, Any] = {
+                "request_id": request_id,
+                "seq": seq,
+                "text_delta": chunk.text_delta,
+                "done": False,
+            }
+            if chunk.logprobs:
+                event["logprobs"] = list(chunk.logprobs)
+            seq += 1
+            yield f"data: {json.dumps(event)}\n\n"
     except GenerationError as exc:
         terminal_outcome_selected = True
         logger.info("stream_generate refused after preflight: %s", exc)
