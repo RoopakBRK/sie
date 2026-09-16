@@ -1348,11 +1348,7 @@ fn build_usage_only_chunk_event(
         _ => return None,
     };
     let usage = chunk.usage.as_ref()?;
-    let mut usage_body = json!({
-        "prompt_tokens": usage.prompt_tokens,
-        "completion_tokens": usage.completion_tokens,
-        "total_tokens": usage.total_tokens,
-    });
+    let mut usage_body = json!(usage);
     merge_terminal_usage_extras(&mut usage_body, terminal_extras);
     Some(json!({
         "id": id,
@@ -1436,11 +1432,7 @@ fn build_generate_chunk_event(chunk: &ChunkEnvelope, terminal_extras: &[(String,
             obj.insert("finish_reason".to_string(), json!(fr));
         }
         if let Some(u) = chunk.usage.as_ref() {
-            let mut usage = json!({
-                "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
-                "total_tokens": u.total_tokens,
-            });
+            let mut usage = json!(u);
             merge_terminal_usage_extras(&mut usage, terminal_extras);
             obj.insert("usage".to_string(), usage);
         }
@@ -1781,6 +1773,7 @@ mod tests {
                 // whose usage is the count-so-far.
                 finish_reason: "cancelled".to_string(),
                 usage: Some(UsageBlock {
+                    images: None,
                     prompt_tokens: 5,
                     completion_tokens,
                     total_tokens: 5 + completion_tokens,
@@ -2023,6 +2016,7 @@ mod tests {
             let mut terminal = _terminal_chunk("error", None);
             terminal.seq = 42;
             terminal.usage = Some(UsageBlock {
+                images: None,
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,
@@ -2044,6 +2038,7 @@ mod tests {
             let mut terminal = _terminal_chunk("error", None);
             terminal.seq = 42;
             terminal.usage = Some(UsageBlock {
+                images: None,
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,
@@ -2725,6 +2720,7 @@ mod tests {
         let chunk = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                images: None,
                 prompt_tokens: 10,
                 completion_tokens: 7,
                 total_tokens: 17,
@@ -3142,6 +3138,7 @@ mod tests {
         collector.apply(_terminal_chunk(
             "stop",
             Some(UsageBlock {
+                images: None,
                 prompt_tokens: 2,
                 completion_tokens: 2,
                 total_tokens: 4,
@@ -3177,6 +3174,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
@@ -3217,6 +3215,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
@@ -3262,6 +3261,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
@@ -3327,6 +3327,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
@@ -3361,6 +3362,7 @@ mod tests {
         let terminal = _terminal_chunk(
             "stop",
             Some(UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
@@ -3493,6 +3495,7 @@ mod tests {
         collector.apply(_terminal_chunk(
             "stop",
             Some(UsageBlock {
+                images: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,

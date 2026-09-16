@@ -962,6 +962,7 @@ export interface GenerationUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  images?: number;
   creditsCharged?: number;
   rateBookVersion?: string;
 }
@@ -1277,6 +1278,7 @@ export interface ChatUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  images?: number;
   credits_charged?: number;
   rate_book_version?: string;
 }

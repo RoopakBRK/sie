@@ -2031,6 +2031,8 @@ class StreamingProcessor:
         # Dispatch a copy of that mapping so admission and execution cannot
         # drift through a second set of keyword-construction rules.
         gen_kwargs = dict(generation_parameters)
+        images = gen_kwargs.get("images")
+        image_count = len(images) if images else None
         # Worker-side phase boundary (#3136): everything between work receipt
         # and this adapter dispatch — deserialization, validation, model load,
         # chat-template render, context checks, and KV-admission wait — is the
@@ -2384,6 +2386,7 @@ class StreamingProcessor:
                         finish_reason=chunk.finish_reason or "stop",
                         prompt_tokens=chunk.prompt_tokens,
                         completion_tokens=chunk.completion_tokens,
+                        images=image_count if not terminal_has_error and chunk.finish_reason != "cancelled" else None,
                         ttft_ms=_compute_ttft_ms(publish_at, first_text_at),
                         error_code=(chunk.error_code or "inference_error") if terminal_has_error else None,
                         error_message=(
@@ -4067,6 +4070,7 @@ def _encode_chunk(
     finish_reason: FinishReason | None = None,
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
+    images: int | None = None,
     ttft_ms: float | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
@@ -4105,6 +4109,8 @@ def _encode_chunk(
             "completion_tokens": int(completion_tokens or 0),
             "total_tokens": int((prompt_tokens or 0) + (completion_tokens or 0)),
         }
+        if images is not None:
+            payload["usage"]["images"] = images
     if ttft_ms is not None:
         payload["ttft_ms"] = ttft_ms
     if error_code is not None or error_message is not None:

@@ -727,6 +727,15 @@
             "minimum": 0,
             "type": "integer"
           },
+          "images": {
+            "description": "Number of input images observed by the worker after successful execution.",
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "prompt_tokens": {
             "format": "int32",
             "minimum": 0,
@@ -1805,6 +1814,15 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "images": {
+            "description": "Number of input images observed by the worker after successful execution.",
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "prompt_tokens": {
             "format": "int32",

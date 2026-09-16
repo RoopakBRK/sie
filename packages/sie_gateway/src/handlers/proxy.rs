@@ -4449,7 +4449,7 @@ async fn queue_mode_streaming_generate(
         HeaderName::from_static("x-sie-server-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    insert_stream_model_revision_header(
+    insert_buffered_generation_model_revision_header(
         response.headers_mut(),
         model_revision,
         bundle_config_hash,
@@ -6363,11 +6363,7 @@ fn build_chat_completion_body(
         // backend-config identifier (see `system_fingerprint`). Present and
         // identical in shape on both the blocking and streaming responses.
         "system_fingerprint": system_fingerprint(model),
-        "usage": {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        }
+        "usage": usage
     });
     Ok(serde_json::to_vec(&body).unwrap_or_default())
 }
@@ -7323,7 +7319,7 @@ async fn proxy_chat_inner(
         HeaderName::from_static("x-sie-server-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    insert_stream_model_revision_header(
+    insert_buffered_generation_model_revision_header(
         response.headers_mut(),
         model_revision.as_deref(),
         &bundle_config_hash,
@@ -7760,11 +7756,7 @@ fn build_text_completion_body(
             "finish_reason": map_chat_finish_reason(&outcome.finish_reason),
         }],
         "system_fingerprint": system_fingerprint(model),
-        "usage": {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        }
+        "usage": usage
     });
     Ok(serde_json::to_vec(&body).unwrap_or_default())
 }
@@ -7969,7 +7961,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         HeaderName::from_static("x-sie-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    insert_stream_model_revision_header(
+    insert_buffered_generation_model_revision_header(
         h,
         model_revision.as_deref(),
         &bundle_config_hash,
@@ -8569,7 +8561,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         HeaderName::from_static("x-sie-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    insert_stream_model_revision_header(
+    insert_buffered_generation_model_revision_header(
         h,
         model_revision.as_deref(),
         &bundle_config_hash,
@@ -9368,7 +9360,7 @@ fn insert_model_revision_header(
     }
 }
 
-fn insert_stream_model_revision_header(
+fn insert_buffered_generation_model_revision_header(
     headers: &mut HeaderMap,
     model_revision: Option<&str>,
     expected_bundle_config_hash: &str,
@@ -9778,13 +9770,7 @@ pub(crate) fn build_generate_success_body_v2(
     outcome: &crate::queue::streaming::StreamOutcome,
     use_msgpack: bool,
 ) -> Vec<u8> {
-    let usage_value = outcome.usage.as_ref().map(|u| {
-        json!({
-            "prompt_tokens": u.prompt_tokens,
-            "completion_tokens": u.completion_tokens,
-            "total_tokens": u.total_tokens,
-        })
-    });
+    let usage_value = outcome.usage.as_ref().map(|usage| json!(usage));
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), json!(model));
     body.insert("text".to_string(), json!(outcome.text));
@@ -13935,7 +13921,7 @@ mod tests {
             execution_identity_sha256: None,
             execution_binding_sha256: None,
         };
-        insert_stream_model_revision_header(
+        insert_buffered_generation_model_revision_header(
             &mut headers,
             Some(revision),
             execution_hash.as_str(),
@@ -13950,7 +13936,7 @@ mod tests {
 
         headers.clear();
         stream_outcome.executed_bundle_config_hash = Some("b".repeat(64));
-        insert_stream_model_revision_header(
+        insert_buffered_generation_model_revision_header(
             &mut headers,
             Some(revision),
             execution_hash.as_str(),
@@ -13959,7 +13945,7 @@ mod tests {
         assert!(headers.get("x-sie-model-revision").is_none());
 
         stream_outcome.executed_bundle_config_hash = None;
-        insert_stream_model_revision_header(
+        insert_buffered_generation_model_revision_header(
             &mut headers,
             Some(revision),
             execution_hash.as_str(),
@@ -14056,6 +14042,58 @@ mod tests {
         outcome.execution_identity_sha256 = Some("bad".to_string());
         insert_stream_execution_identity_header(&mut headers, &outcome);
         assert!(headers.get("x-sie-execution-identity-sha256").is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_generation_preserves_terminal_images_and_validated_binding() {
+        use crate::queue::streaming::{ChunkEnvelope, StreamCollector};
+        for (identity, binding) in [
+            (Some("a".repeat(64)), Some("b".repeat(64))),
+            (Some("a".repeat(64)), None),
+            (None, Some("b".repeat(64))),
+            (Some("bad".to_string()), Some("b".repeat(64))),
+            (Some("a".repeat(64)), Some("invalid".to_string())),
+            (Some("a".repeat(64)), Some("c".repeat(64))),
+        ] {
+            let (sender, _receiver) = tokio::sync::oneshot::channel();
+            let mut collector = StreamCollector::new(sender, "test/model".into(), "default".into());
+            for seq in 0..=1 {
+                let chunk: ChunkEnvelope = serde_json::from_value(json!({
+                    "kind": "chunk", "request_id": "request-1", "attempt_id": "attempt-1",
+                    "seq": seq, "text_delta": "", "done": seq == 1,
+                    "execution_identity_sha256": if seq == 0 { identity.clone() } else { Some("a".repeat(64)) },
+                    "execution_binding_sha256": if seq == 0 { binding.clone() } else { Some("b".repeat(64)) },
+                    "finish_reason": if seq == 1 { Some("stop") } else { None },
+                    "usage": if seq == 1 { Some(json!({
+                        "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7, "images": 1
+                    })) } else { None },
+                })).unwrap();
+                collector.apply(chunk);
+            }
+            let outcome = collector.build_outcome().unwrap();
+            let mut headers = HeaderMap::new();
+            insert_stream_execution_binding_header(&mut headers, &outcome);
+            insert_stream_execution_identity_header(&mut headers, &outcome);
+            assert_eq!(
+                headers.contains_key("x-sie-execution-binding-sha256"),
+                identity.as_deref() == Some(&"a".repeat(64))
+                    && binding.as_deref() == Some(&"b".repeat(64))
+            );
+            assert_eq!(
+                headers.contains_key("x-sie-execution-identity-sha256"),
+                headers.contains_key("x-sie-execution-binding-sha256")
+            );
+            for msgpack in [false, true] {
+                let bytes = build_generate_success_body_v2("test/model", &outcome, msgpack);
+                let body: serde_json::Value = if msgpack {
+                    rmp_serde::from_slice(&bytes).unwrap()
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                assert_eq!(body["usage"]["images"], 1);
+                assert_eq!(body["usage"]["total_tokens"], 7);
+            }
+        }
     }
 
     #[test]
@@ -14568,6 +14606,7 @@ mod tests {
                 text: "ok".to_string(),
                 finish_reason: "stop".to_string(),
                 usage: Some(crate::queue::streaming::UsageBlock {
+                    images: None,
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
@@ -17680,6 +17719,7 @@ mod tests {
             text: "Hello world!".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 3,
                 total_tokens: 8,
@@ -22056,6 +22096,7 @@ mod tests {
             text: String::new(),
             finish_reason: "stop".to_string(),
             usage: Some(UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 9,
                 total_tokens: 14,
@@ -22111,6 +22152,7 @@ mod tests {
             text: String::new(),
             finish_reason: "tool_calls".to_string(),
             usage: Some(UsageBlock {
+                images: None,
                 prompt_tokens: 6,
                 completion_tokens: 12,
                 total_tokens: 18,
@@ -22178,6 +22220,7 @@ mod tests {
             text: String::new(),
             finish_reason: "stop".to_string(),
             usage: Some(UsageBlock {
+                images: None,
                 prompt_tokens: 3,
                 completion_tokens: 4,
                 total_tokens: 7,
@@ -22560,6 +22603,7 @@ mod tests {
             text: "a continuation".to_string(),
             finish_reason: "length".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 4,
                 completion_tokens: 16,
                 total_tokens: 20,
@@ -23183,6 +23227,7 @@ mod tests {
             text: "a joke".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
@@ -23240,6 +23285,7 @@ mod tests {
             text: "Hi there!".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 3,
                 total_tokens: 8,
@@ -23330,6 +23376,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
@@ -23367,6 +23414,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
@@ -23399,6 +23447,7 @@ mod tests {
             text: String::new(),
             finish_reason: "tool_calls".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 7,
                 completion_tokens: 11,
                 total_tokens: 18,
@@ -23972,6 +24021,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
