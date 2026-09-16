@@ -2444,12 +2444,12 @@ def test_chunk_translator_rejects_malformed_nonnull_finish_metadata(finish: Any)
         )
 
 
-@pytest.mark.parametrize("indexes", [[], [0], [0, 0], [0, 2], [0, True], [0, "1"]])
+@pytest.mark.parametrize("indexes", [[], [0], [0, 0], [0, 2], [0, True], [0, "1"], [1, None]])
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
 def test_streaming_candidates_require_exact_distinct_terminals(mock_async_client: MagicMock, adapter, indexes) -> None:
     events = [
         {
-            "index": index,
+            **({"index": index} if index is not None else {}),
             "text": "value",
             "meta_info": {
                 "finish_reason": {"type": "stop"},

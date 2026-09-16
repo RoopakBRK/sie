@@ -1273,7 +1273,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                         except json.JSONDecodeError:
                             continue
                         _raise_for_sglang_event_error(event, grammar=grammar)
-                        idx = event.get("index", 0)
+                        idx = event.get("index")
                         if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < return_count:
                             raise GenerationError("SGLang /generate returned an invalid candidate index")
                         if idx in completed_candidates:
