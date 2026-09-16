@@ -83,7 +83,12 @@ from sie_server.processors.tool_call_grammar import (
     normalize_tool_choice,
 )
 from sie_server.processors.tool_call_parser import ToolCallFormat, parse_tool_call_stream
-from sie_server.types.grammar import GrammarSpec, GrammarValidationError, hash_grammar
+from sie_server.types.grammar import (
+    OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+    GrammarSpec,
+    GrammarValidationError,
+    hash_grammar,
+)
 from sie_server.types.inputs import ImageInput
 
 # Module-level shim around :func:`asyncio.wait_for`. Tests monkey-patch
@@ -3631,8 +3636,8 @@ class StreamingProcessor:
                 # load, so a generous ceiling here still guarantees the
                 # follower settles its own work item rather than hanging
                 # until ack_wait and triggering redelivery.
-                await _wait_for(future_to_await, timeout=_GRAMMAR_FOLLOWER_TIMEOUT_S)
-            except Exception:  # noqa: BLE001
+                await _wait_for(asyncio.shield(future_to_await), timeout=_GRAMMAR_FOLLOWER_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001
                 # Leader's compile failed, was cancelled, or did not
                 # resolve in time; surface the same terminal-error path.
                 logger.warning(
@@ -3641,13 +3646,22 @@ class StreamingProcessor:
                     attempt_id,
                     exc_info=True,
                 )
+                known_type_refusal = (
+                    grammar.kind == "json_schema"
+                    and isinstance(exc, GrammarValidationError)
+                    and exc.code == "invalid_request"
+                    and exc.args == (OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,)
+                )
                 await self._terminal_error_then_settle(
                     reply_subject,
                     request_id=request_id,
                     attempt_id=attempt_id,
                     seq=0,
-                    code="grammar_compile_failed",
-                    message=_INTERNAL_GRAMMAR_COMPILE_MESSAGE,
+                    code="invalid_request" if known_type_refusal else "grammar_compile_failed",
+                    message=OUTLINES_JSON_SCHEMA_TYPE_MESSAGE
+                    if known_type_refusal
+                    else _INTERNAL_GRAMMAR_COMPILE_MESSAGE,
+                    param="grammar" if known_type_refusal else None,
                     msg=msg,
                 )
                 return False
@@ -3790,6 +3804,11 @@ class StreamingProcessor:
                 seq=0,
                 code=exc.code,
                 message=str(exc),
+                param="grammar"
+                if grammar.kind == "json_schema"
+                and exc.code == "invalid_request"
+                and exc.args == (OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,)
+                else None,
                 msg=msg,
             )
             return False

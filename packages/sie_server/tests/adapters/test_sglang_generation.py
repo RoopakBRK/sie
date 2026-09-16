@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Self
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from sie_server.adapters._generation_base import (
     GenerationChunk,
@@ -38,9 +39,11 @@ from sie_server.adapters.sglang.generation import (
     _mamba_scheduler_strategy_value,
     _p_unsafe_from_verdict_logprobs,
     _parse_sglang_generate_response,
+    _raise_for_sglang_event_error,
+    _raise_for_sglang_http_error,
     _thresholded_verdict,
 )
-from sie_server.types.grammar import GrammarSpec
+from sie_server.types.grammar import OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, GrammarSpec
 from sie_server.types.inputs import InvalidMediaError
 
 
@@ -500,7 +503,9 @@ def test_generate_n_gt_one_fans_out_into_candidates(mock_async_client: MagicMock
     resp.json = MagicMock(return_value=sglang_results)
     resp.raise_for_status = MagicMock()
     client_instance = _make_client_with_stream(_FakeStreamingResponse([]))
-    client_instance.post = AsyncMock(return_value=resp)
+    resp.aread = AsyncMock()
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    client_instance.stream.return_value = resp
     mock_async_client.return_value = client_instance
     adapter._server_url = "http://localhost:30005"
 
@@ -524,7 +529,7 @@ def test_generate_n_gt_one_fans_out_into_candidates(mock_async_client: MagicMock
     assert term.prompt_tokens == 4
     assert term.completion_tokens == 25
     # The request asked SGLang for n candidates, non-streaming.
-    body = client_instance.post.call_args.kwargs["json"]
+    body = client_instance.stream.call_args.kwargs["json"]
     assert body["sampling_params"]["n"] == 2
     assert body["stream"] is False
 
@@ -680,7 +685,9 @@ def test_generate_best_of_ranks_by_logprob_and_trims(mock_async_client: MagicMoc
     resp.json = MagicMock(return_value=sglang_results)
     resp.raise_for_status = MagicMock()
     client_instance = _make_client_with_stream(_FakeStreamingResponse([]))
-    client_instance.post = AsyncMock(return_value=resp)
+    resp.aread = AsyncMock()
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    client_instance.stream.return_value = resp
     mock_async_client.return_value = client_instance
     adapter._server_url = "http://localhost:30005"
 
@@ -695,7 +702,7 @@ def test_generate_best_of_ranks_by_logprob_and_trims(mock_async_client: MagicMoc
     assert term.candidates is not None
     assert len(term.candidates) == 1  # trimmed to n
     assert term.candidates[0]["text"] == " best"  # highest cumulative logprob (-0.2)
-    body = client_instance.post.call_args.kwargs["json"]
+    body = client_instance.stream.call_args.kwargs["json"]
     assert body["sampling_params"]["n"] == 3  # over-generated best_of
     assert body["return_logprob"] is True  # ranking needs logprobs
 
@@ -1845,7 +1852,9 @@ def test_generate_n_gt_one_non_streaming_emits_per_candidate_logprobs(mock_async
     resp.json = MagicMock(return_value=sglang_results)
     resp.raise_for_status = MagicMock()
     client_instance = _make_client_with_stream(_FakeStreamingResponse([]))
-    client_instance.post = AsyncMock(return_value=resp)
+    resp.aread = AsyncMock()
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    client_instance.stream.return_value = resp
     mock_async_client.return_value = client_instance
     adapter._server_url = "http://localhost:30005"
 
@@ -1900,7 +1909,9 @@ def test_generate_n_gt_one_non_streaming_omits_logprobs_when_not_requested(
     resp.json = MagicMock(return_value=sglang_results)
     resp.raise_for_status = MagicMock()
     client_instance = _make_client_with_stream(_FakeStreamingResponse([]))
-    client_instance.post = AsyncMock(return_value=resp)
+    resp.aread = AsyncMock()
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    client_instance.stream.return_value = resp
     mock_async_client.return_value = client_instance
     adapter._server_url = "http://localhost:30005"
 
@@ -2375,7 +2386,10 @@ def test_backend_grammar_abort_never_emits_placeholder_or_usage(
         {"text": "valid", "meta_info": {"finish_reason": {"type": "stop"}}},
         abort,
     ]
-    client.post = AsyncMock(return_value=response)
+    response.aread = AsyncMock()
+    response.__aenter__ = AsyncMock(return_value=response)
+    if not stream:
+        client.stream.return_value = response
     mock_async_client.return_value = client
     adapter._server_url = "http://localhost:30005"
     chunks = []
@@ -2477,7 +2491,9 @@ def test_buffered_candidates_require_exact_count_before_ranking(
         {"text": "value", "meta_info": {"finish_reason": {"type": "stop"}}} for _ in range(count)
     ]
     client = _make_client_with_stream(_FakeStreamingResponse([]))
-    client.post = AsyncMock(return_value=response)
+    response.aread = AsyncMock()
+    response.__aenter__ = AsyncMock(return_value=response)
+    client.stream.return_value = response
     mock_async_client.return_value = client
     adapter._server_url = "http://localhost:30005"
     chunks = []
@@ -2637,3 +2653,223 @@ def test_guard_first_sampled_verdict_requires_complete_evidence() -> None:
     assert _p_unsafe_from_verdict_logprobs((incomplete_yes, later_safe)) is None
     missing_sampled = {"token": "Yes", "top_logprobs": [_lp("Yes", -0.1), _lp("No", -3)]}
     assert _p_unsafe_from_verdict_logprobs((missing_sampled, later_safe)) is None
+
+
+_TYPE_DIAGNOSTIC = "Failed to compile json grammar: 'type' must be a string"
+_TYPE_GRAMMAR = GrammarSpec(kind="json_schema", value={"type": ["string", "null"]})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("n", "stream", "best_of"), [(1, False, None), (1, True, None), (2, True, None), (2, False, None), (1, False, 2)]
+)
+@pytest.mark.parametrize("transport", ["http", "abort"])
+async def test_outlines_type_refusal_across_generate_paths(adapter, n, stream, best_of, transport) -> None:
+    abort = {
+        "text": "[]",
+        "meta_info": {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "finish_reason": {"type": "abort", "status_code": 400, "message": _TYPE_DIAGNOSTIC},
+        },
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if transport == "http":
+            return httpx.Response(400, json={"error": {"message": _TYPE_DIAGNOSTIC}})
+        if body["stream"]:
+            return httpx.Response(200, text="data: " + json.dumps(abort) + "\n\n")
+        return httpx.Response(200, json=[abort] * body["sampling_params"]["n"])
+
+    chunks = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        adapter._http_client = client
+        adapter._server_url = "http://localhost:30005"
+        with pytest.raises(GenerationInvalidRequestError) as error:
+            async for chunk in adapter.generate(
+                prompt="Optional value", max_new_tokens=8, n=n, stream=stream, best_of=best_of, grammar=_TYPE_GRAMMAR
+            ):
+                chunks.append(chunk)
+    assert error.value.code == "invalid_request"
+    assert error.value.param == "grammar"
+    assert str(error.value) == OUTLINES_JSON_SCHEMA_TYPE_MESSAGE
+    assert chunks == []
+
+
+@pytest.mark.parametrize(
+    ("backend", "grammar", "status", "message"),
+    [
+        ("xgrammar", _TYPE_GRAMMAR, 400, _TYPE_DIAGNOSTIC),
+        (None, _TYPE_GRAMMAR, 400, _TYPE_DIAGNOSTIC),
+        ("outlines", None, 400, _TYPE_DIAGNOSTIC),
+        ("outlines", GrammarSpec(kind="regex", value=".*"), 400, _TYPE_DIAGNOSTIC),
+        ("outlines", _TYPE_GRAMMAR, 500, _TYPE_DIAGNOSTIC),
+        ("outlines", _TYPE_GRAMMAR, 400.0, _TYPE_DIAGNOSTIC),
+        ("outlines", _TYPE_GRAMMAR, "400", _TYPE_DIAGNOSTIC),
+        ("outlines", _TYPE_GRAMMAR, 400, _TYPE_DIAGNOSTIC + " secret"),
+        ("outlines", _TYPE_GRAMMAR, 400, "secret " + _TYPE_DIAGNOSTIC),
+        ("outlines", _TYPE_GRAMMAR, 400, [_TYPE_DIAGNOSTIC]),
+        ("outlines", _TYPE_GRAMMAR, 400, "x" * 8192),
+    ],
+)
+def test_abort_type_refusal_requires_exact_diagnostic_and_context(backend, grammar, status, message) -> None:
+    event = {"meta_info": {"finish_reason": {"type": "abort", "status_code": status, "message": message}}}
+    with pytest.raises(GenerationError) as error:
+        _raise_for_sglang_event_error(event, grammar=grammar, grammar_backend=backend)
+    assert str(error.value) != OUTLINES_JSON_SCHEMA_TYPE_MESSAGE
+    assert "secret" not in str(error.value)
+    assert _TYPE_DIAGNOSTIC not in str(error.value)
+
+
+def test_unqualified_in_band_error_is_not_a_type_refusal() -> None:
+    with pytest.raises(GenerationError) as error:
+        _raise_for_sglang_event_error(
+            {"error": {"message": _TYPE_DIAGNOSTIC}}, grammar=_TYPE_GRAMMAR, grammar_backend="outlines"
+        )
+    assert error.value.code == "inference_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not json",
+        b'{"detail":"Failed to compile json grammar: \'type\' must be a string"}',
+        b'{"error":{"message":"Failed to compile json grammar: \'type\' must be a string","message":"secret"}}',
+        b'{"error":{"message":"secret","message":"Failed to compile json grammar: \'type\' must be a string"}}',
+        json.dumps({"error": {"message": _TYPE_DIAGNOSTIC, "schema": "secret"}}).encode(),
+        json.dumps({"error": {"message": _TYPE_DIAGNOSTIC + " secret"}}).encode(),
+        json.dumps({"error": {"message": [_TYPE_DIAGNOSTIC]}}).encode(),
+        json.dumps({"error": {"message": _TYPE_DIAGNOSTIC}}).encode() + b" " * 4096,
+        b"[" * 2000 + b"]" * 2000,
+    ],
+)
+async def test_http_type_refusal_rejects_unknown_malformed_or_oversized_body(body) -> None:
+    response = httpx.Response(400, content=body, request=httpx.Request("POST", "http://localhost/generate"))
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        await _raise_for_sglang_http_error(response, grammar=_TYPE_GRAMMAR, grammar_backend="outlines")
+    assert "secret" not in str(error.value)
+    assert _TYPE_DIAGNOSTIC not in str(error.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "backend", "grammar"),
+    [
+        (500, "outlines", _TYPE_GRAMMAR),
+        (502, "outlines", _TYPE_GRAMMAR),
+        (400, "xgrammar", _TYPE_GRAMMAR),
+        (400, "outlines", None),
+        (400, "outlines", GrammarSpec(kind="regex", value=".*")),
+    ],
+)
+async def test_http_type_refusal_requires_status_backend_and_grammar(status, backend, grammar) -> None:
+    response = httpx.Response(
+        status,
+        json={"error": {"message": _TYPE_DIAGNOSTIC}},
+        request=httpx.Request("POST", "http://localhost/generate"),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await _raise_for_sglang_http_error(response, grammar=grammar, grammar_backend=backend)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["oversized", "timeout", "cancel"])
+@pytest.mark.parametrize(
+    ("n", "stream", "best_of"), [(1, False, None), (2, True, None), (2, False, None), (1, False, 2)]
+)
+async def test_http_error_read_is_bounded_and_closes_stream(adapter, mode, n, stream, best_of) -> None:
+    closed = asyncio.Event()
+    started = asyncio.Event()
+    reads = []
+
+    class ErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            started.set()
+            if mode == "oversized":
+                reads.append(1)
+                yield b" " * 4097
+                raise AssertionError("oversized body must not be drained")
+            await asyncio.Event().wait()
+            yield b""
+
+        async def aclose(self):
+            closed.set()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(400, stream=ErrorStream()))
+    ) as client:
+        adapter._http_client = client
+        adapter._server_url = "http://localhost:30005"
+        iterator = adapter.generate(
+            prompt="Optional value", max_new_tokens=8, grammar=_TYPE_GRAMMAR, n=n, stream=stream, best_of=best_of
+        )
+        task = asyncio.create_task(anext(iterator))
+        await started.wait()
+        if mode == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(httpx.HTTPStatusError):
+                await asyncio.wait_for(task, timeout=3)
+        await iterator.aclose()
+    assert closed.is_set()
+    assert reads == ([1] if mode == "oversized" else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "encoding", ["gzip", "br", "GZIP", "IDENTITY", "identity, gzip", "identity, identity", "unknown", ""]
+)
+@pytest.mark.parametrize(
+    ("n", "stream", "best_of"), [(1, False, None), (2, True, None), (2, False, None), (1, False, 2)]
+)
+async def test_encoded_http_error_is_not_read_or_decompressed(adapter, encoding, n, stream, best_of) -> None:
+    closed = asyncio.Event()
+
+    class EncodedErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise AssertionError("encoded error must not be read or decompressed")
+            yield b""
+
+        async def aclose(self):
+            closed.set()
+
+    def respond(_):
+        return httpx.Response(400, headers={"Content-Encoding": encoding}, stream=EncodedErrorStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        adapter._http_client = client
+        adapter._server_url = "http://localhost:30005"
+        with pytest.raises(httpx.HTTPStatusError):
+            async for _ in adapter.generate(
+                prompt="Optional value", max_new_tokens=8, grammar=_TYPE_GRAMMAR, n=n, stream=stream, best_of=best_of
+            ):
+                raise AssertionError("error response must not yield a generation chunk")
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("n", "stream", "best_of"), [(1, False, None), (2, True, None), (2, False, None), (1, False, 2)]
+)
+async def test_duplicate_event_keys_raise_typed_error_before_output(adapter, n, stream, best_of) -> None:
+    payload = '{"text":"secret","text":"[]","meta_info":{"finish_reason":{"type":"stop"},"prompt_tokens":1,"completion_tokens":1}}'
+
+    def respond(request):
+        body = json.loads(request.content)
+        content = "data: " + payload + "\n\n" if body["stream"] else "[" + payload + "]"
+        return httpx.Response(200, text=content)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        adapter._http_client = client
+        adapter._server_url = "http://localhost:30005"
+        with pytest.raises(GenerationError, match="duplicate JSON keys") as error:
+            async for _ in adapter.generate(
+                prompt="Optional value", max_new_tokens=8, grammar=_TYPE_GRAMMAR, n=n, stream=stream, best_of=best_of
+            ):
+                raise AssertionError("duplicate keys must not yield text or usage")
+    assert error.value.code == "inference_error"
+    assert "secret" not in str(error.value)
