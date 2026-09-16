@@ -34,6 +34,35 @@ for entry in scores["scores"]:
     print(entry["item_id"], entry["score"])
 ```
 
+## Generation prompts and guard verdicts
+
+`generate` and `stream_generate` treat text-only prompts as raw continuation
+input. They do not render a chat template, including model settings such as
+`enable_thinking` or `guardian_config`. Already-rendered prompts stay unchanged.
+Native requests with images render the prompt and images as one user turn.
+
+Use `chat_completions` or `stream_chat_completions` with messages for chat,
+instruction-based structured output (`response_format`), and guard checks:
+
+```python
+answer = client.chat_completions(
+    "Qwen/Qwen3-4B-Instruct-2507",
+    [{"role": "user", "content": "Write a haiku about the sea."}],
+    max_completion_tokens=64,
+)
+print(answer["choices"][0]["message"]["content"])
+```
+
+The worker renders the selected model's template and applies served template
+settings with operator configuration taking precedence over request kwargs.
+Granite Guardian's shipped risk dimension is `harm`; prose requesting a
+different dimension does not change that setting. Its configured threshold
+produces `Yes` (unsafe) or `No` (safe). A missing or invalid verdict returns
+`invalid_guard_verdict`; never treat an error or an empty response as safe.
+Private reasoning is hidden on both input surfaces. If it consumes the entire
+generation budget without usable output, the request fails with
+`empty_model_output`.
+
 ## Connecting to a managed SIE platform
 
 The examples above target a local server. For a managed SIE gateway,

@@ -1120,8 +1120,11 @@ async def test_streaming_processor_hides_reasoning_for_every_resolved_profile(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enable_thinking", [False, True])
-async def test_streaming_processor_renders_chat_template(monkeypatch, enable_thinking: bool) -> None:
+@pytest.mark.parametrize(
+    "template_kwargs",
+    [{"enable_thinking": False}, {"enable_thinking": True}, {"guardian_config": {"risk_name": "harm"}}],
+)
+async def test_streaming_processor_renders_chat_template(monkeypatch, template_kwargs: dict[str, Any]) -> None:
     """``Messages`` shape → adapter receives the rendered template string."""
     nc = AsyncMock()
     script = [
@@ -1144,7 +1147,7 @@ async def test_streaming_processor_renders_chat_template(monkeypatch, enable_thi
 
     registry = _make_registry_with_chat_config(
         adapter,
-        chat_template_kwargs={"enable_thinking": enable_thinking},
+        chat_template_kwargs=template_kwargs,
     )
 
     # Patch ``load_tokenizer`` (called from a thread) with a stub that
@@ -1172,7 +1175,7 @@ async def test_streaming_processor_renders_chat_template(monkeypatch, enable_thi
 
     assert len(captured_prompts) == 1
     assert captured_prompts[0] == "<rendered>ping</rendered>"
-    assert seen_kwargs == {"enable_thinking": enable_thinking}
+    assert seen_kwargs == template_kwargs
     decoded = _decode_chunks(nc)
     visible = "".join(chunk.get("text_delta", "") for chunk in decoded)
     assert visible == "hi"
@@ -4026,3 +4029,58 @@ async def test_image_generation_without_token_counts_does_not_synthesize_usage(
     terminal = _terminal_chunk(nc)
     assert terminal["done"] is True
     assert "usage" not in terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tools", [None, [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]]
+)
+async def test_hidden_reasoning_emits_progress_before_visible_answer(
+    monkeypatch: pytest.MonkeyPatch, tools: Any
+) -> None:
+    nc = AsyncMock()
+    script = [
+        GenerationChunk(text_delta="<think>private", is_first=True, logprobs=({"token": "private"},)),
+        GenerationChunk(text_delta=" still private"),
+        GenerationChunk(text_delta="</think>Answer"),
+        GenerationChunk(text_delta="", done=True, finish_reason="stop", prompt_tokens=2, completion_tokens=8),
+    ]
+    adapter = _FakeGenAdapter(script)
+    registry = _make_registry_with_chat_config(adapter, chat_template_kwargs={"enable_thinking": False})
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    monkeypatch.setattr(proc, "_check_context_length", AsyncMock(return_value=None))
+    monkeypatch.setattr("sie_server.processors.streaming._FLUSH_INTERVAL_S", 0)
+    work = _make_work_item()
+    if tools is not None:
+        work["generate"]["tools"] = tools
+    await proc.process(_make_msg(work), "test/model")
+    decoded = _decode_chunks(nc)
+    assert [chunk["seq"] for chunk in decoded] == list(range(len(decoded)))
+    assert decoded[0]["text_delta"] == ""
+    assert decoded[0]["done"] is False
+    assert not decoded[0].get("is_first")
+    assert decoded[1]["text_delta"] == ""
+    assert "private" not in str(decoded)
+    visible = next(chunk for chunk in decoded if chunk["text_delta"])
+    assert visible["text_delta"] == "Answer"
+    assert visible["is_first"] is True
+    assert decoded[-1]["done"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template_kwargs", [{"enable_thinking": False}, {"guardian_config": {"risk_name": "harm"}}])
+async def test_native_raw_prompt_is_preserved_with_served_template_settings(
+    monkeypatch: pytest.MonkeyPatch, template_kwargs: dict[str, Any]
+) -> None:
+    nc = AsyncMock()
+    adapter = _PreflightGenAdapter()
+    registry = _make_registry_with_chat_config(adapter, chat_template_kwargs=template_kwargs)
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    monkeypatch.setattr(proc, "_check_context_length", AsyncMock(return_value=None))
+    render = AsyncMock()
+    monkeypatch.setattr(proc, "_render_chat_template", render)
+    prompt = "Already rendered prefix\n<assistant>"
+    await proc.process(_make_msg(_make_work_item(generate={"prompt": prompt, "max_new_tokens": 16})), "test/model")
+    assert adapter.dispatched_parameters is not None
+    assert adapter.dispatched_parameters["prompt"] == prompt
+    render.assert_not_called()

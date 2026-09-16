@@ -1085,13 +1085,6 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # verdict from the multi-candidate path. Inert for non-guard models.
         if self._guard and ((n is not None and n > 1) or (best_of is not None and best_of > 1)):
             raise ValueError("guard models support single-candidate generation only (n=1, best_of<=1)")
-        # Whether the CLIENT asked for logprobs, captured before the guard
-        # forcing below. Guard models force logprobs on internally to compute
-        # the verdict threshold; those forced logprobs are an implementation
-        # detail and MUST NOT leak to a client that did not request them
-        # (GenerationChunk.logprobs contract). The streaming guard intercept
-        # uses this to decide whether to strip the forced logprobs.
-        client_requested_logprobs = logprobs
         # Thresholding needs the verdict-token distribution — force logprobs on
         # even if the caller didn't ask. Only affects the n=1 path below.
         if self._guard:
@@ -1548,20 +1541,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
                 # so we slice off the tail-since-last-event each
                 # round to build per-chunk OpenAI-shape logprobs.
                 logprobs_surfaced = 0
-                # Guard verdict buffering (CHECK POLICY) — inert for non-guard
-                # models. A guard's Yes/No verdict can sit a few token positions
-                # in, behind a leading whitespace/punctuation/preamble token that
-                # SGLang spreads across streaming chunks. We accumulate the
-                # leading chunks' per-token logprob entries (``guard_lp_buffer``)
-                # and SUPPRESS their text (the guard consumer wants just the
-                # verdict, not the preamble) until a verdict resolves within the
-                # first ``_GUARD_VERDICT_SCAN_POSITIONS`` positions — or the
-                # stream terminates first, in which case we flush the raw buffered
-                # chunks unchanged (fallback, never drop output).
                 guard_active = bool(self._guard)
                 guard_resolved = False
-                guard_lp_buffer: list[dict[str, Any]] = []
-                guard_pending: list[GenerationChunk] = []
 
                 async for raw_line in response.aiter_lines():
                     line = raw_line.strip()
@@ -1608,69 +1589,33 @@ class SGLangGenerationAdapter(GenerationAdapter):
                             cumulative_lp = event_meta.get("output_token_logprobs")
                             if isinstance(cumulative_lp, list):
                                 logprobs_surfaced = max(logprobs_surfaced, len(cumulative_lp))
-                    # Guard verdict thresholding (CHECK POLICY): resolve the
-                    # P(unsafe)>=threshold verdict from the first parseable
-                    # position within ``_GUARD_VERDICT_SCAN_POSITIONS`` and emit a
-                    # single verdict chunk. Inert for non-guard models, which take
-                    # the byte-for-byte unchanged ``else`` path below.
-                    if guard_active and not guard_resolved:
-                        # Accumulate this chunk's forced logprob entries so a
-                        # verdict that lands on a later token position is visible.
-                        if chunk.logprobs:
-                            guard_lp_buffer.extend(chunk.logprobs)
-                        guard_pending.append(chunk)
-                        verdict = _thresholded_verdict(tuple(guard_lp_buffer), self._guard)
-                        if verdict is not None:
-                            guard_resolved = True
-                            # Carry through terminal state if the verdict resolved
-                            # on (or only by) the terminal chunk, so done /
-                            # finish_reason / completion_tokens are preserved.
-                            last = guard_pending[-1]
-                            # Strip the internally-forced logprobs when the client
-                            # did not ask for them (implementation detail). When
-                            # the client did ask, drop the single verdict entry
-                            # that was consumed/rewritten (it described the raw
-                            # sampled token, not the served threshold verdict) and
-                            # keep the rest of the buffered token metadata.
-                            if client_requested_logprobs:
-                                v_idx = _verdict_position(tuple(guard_lp_buffer))
-                                kept = [e for i, e in enumerate(guard_lp_buffer) if i != v_idx]
-                                remaining = tuple(kept) or None
+                    if guard_active:
+                        if chunk.error_code is not None or chunk.finish_reason in ("error", "cancelled"):
+                            chunk = dataclasses.replace(chunk, text_delta="", is_first=False, logprobs=None)
+                        elif not guard_resolved:
+                            guard_lp_buffer = _guard_verdict_logprobs(event)
+                            verdict = _thresholded_verdict(guard_lp_buffer, self._guard)
+                            if verdict is not None:
+                                guard_resolved = True
+                                chunk = dataclasses.replace(chunk, text_delta=verdict, is_first=True, logprobs=None)
+                            elif chunk.done:
+                                chunk = dataclasses.replace(
+                                    chunk,
+                                    text_delta="",
+                                    is_first=False,
+                                    logprobs=None,
+                                    finish_reason="error",
+                                    error_code="invalid_guard_verdict",
+                                    error_message="guard model did not produce a valid thresholded verdict",
+                                )
                             else:
-                                remaining = None
-                            verdict_chunk = dataclasses.replace(
-                                last,
-                                text_delta=verdict,
-                                is_first=True,
-                                logprobs=remaining,
-                            )
-                            stream_timer.mark_yield(has_text=True)
-                            yield verdict_chunk
-                            if verdict_chunk.done:
-                                break
-                        elif chunk.done:
-                            # Terminal reached without a parseable verdict in the
-                            # first N positions: flush the raw buffered chunks
-                            # unchanged so the response is never dropped. Strip the
-                            # forced logprobs only when the client didn't ask.
-                            guard_resolved = True
-                            for buffered in guard_pending:
-                                if not client_requested_logprobs:
-                                    buffered = dataclasses.replace(buffered, logprobs=None)
-                                stream_timer.mark_yield(has_text=bool(buffered.text_delta))
-                                yield buffered
-                            break
-                        # else: keep buffering (suppress this leading chunk's text).
-                    else:
-                        # Guard tail chunks (after the verdict resolved) must still
-                        # honour the M4 logprobs contract: strip the internally
-                        # forced logprobs when the client didn't request them.
-                        if guard_active and not client_requested_logprobs and chunk.logprobs is not None:
-                            chunk = dataclasses.replace(chunk, logprobs=None)
-                        stream_timer.mark_yield(has_text=bool(chunk.text_delta))
-                        yield chunk
-                        if chunk.done:
-                            break
+                                chunk = dataclasses.replace(chunk, text_delta="", is_first=False, logprobs=None)
+                        else:
+                            chunk = dataclasses.replace(chunk, text_delta="", is_first=False, logprobs=None)
+                    stream_timer.mark_yield(has_text=bool(chunk.text_delta))
+                    yield chunk
+                    if chunk.done:
+                        break
 
                 if not terminal_yielded:
                     raise RuntimeError("SGLang stream terminated without terminal event")
@@ -1707,45 +1652,63 @@ class SGLangGenerationAdapter(GenerationAdapter):
             )
 
 
+def _guard_verdict_logprobs(event: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    meta = event.get("meta_info")
+    if not isinstance(meta, dict):
+        return ()
+    tokens, top = meta.get("output_token_logprobs"), meta.get("output_top_logprobs")
+    if not isinstance(tokens, list) or not isinstance(top, list):
+        return ()
+    entries: list[dict[str, Any]] = []
+    for index, token in enumerate(tokens[:_GUARD_VERDICT_SCAN_POSITIONS]):
+        if index >= len(top):
+            return ()
+        alternatives = top[index]
+        if not isinstance(alternatives, list):
+            return ()
+        parsed: list[dict[str, Any]] = []
+        for raw in [token, *alternatives]:
+            if not isinstance(raw, (list, tuple)) or len(raw) < 3 or not isinstance(raw[2], str):
+                return ()
+            value = raw[0]
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value > 0:
+                return ()
+            parsed.append({"token": raw[2], "logprob": value, "bytes": list(raw[2].encode("utf-8"))})
+        entries.append({**parsed[0], "top_logprobs": parsed[1:]})
+        if parsed[0]["token"].strip().lower() in ("yes", "no"):
+            break
+    return tuple(entries)
+
+
 def _p_unsafe_from_entry(entry: Any) -> float | None:
     """``P(unsafe)`` from one OpenAI-shape content token's ``top_logprobs``.
 
     Renormalises ``exp(lp_yes)/(exp(lp_yes)+exp(lp_no))`` over the ``yes``/``no``
-    verdict tokens in this single position. ``None`` when neither appears.
+    verdict tokens in this single position. Both probabilities are required.
     """
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or str(entry.get("token") or "").strip().lower() not in ("yes", "no"):
         return None
     lp_yes: float | None = None
     lp_no: float | None = None
-    for top in entry.get("top_logprobs") or []:
+    for top in [entry, *(entry.get("top_logprobs") or [])]:
         if not isinstance(top, dict):
             continue
         tok = str(top.get("token") or "").strip().lower()
         val = top.get("logprob")
-        if not isinstance(val, (int, float)) or isinstance(val, bool):
+        if tok not in ("yes", "no"):
             continue
+        if not isinstance(val, (int, float)) or isinstance(val, bool) or not math.isfinite(val) or val > 0:
+            return None
         if tok == "yes":
             lp_yes = val if lp_yes is None else max(lp_yes, val)
         elif tok == "no":
             lp_no = val if lp_no is None else max(lp_no, val)
-    if lp_yes is None and lp_no is None:
+    if lp_yes is None or lp_no is None:
         return None
-    ey = math.exp(lp_yes) if lp_yes is not None else 0.0
-    en = math.exp(lp_no) if lp_no is not None else 0.0
+    offset = max(lp_yes, lp_no)
+    ey = math.exp(lp_yes - offset)
+    en = math.exp(lp_no - offset)
     return ey / (ey + en) if (ey + en) > 0 else None
-
-
-def _verdict_position(chunk_logprobs: Any, scan_positions: int = _GUARD_VERDICT_SCAN_POSITIONS) -> int | None:
-    """Index of the first position (within ``scan_positions``) carrying a verdict
-    distribution, or ``None``. The consumed/rewritten verdict entry the streaming
-    intercept drops from client-requested logprobs.
-    """
-    if not chunk_logprobs:
-        return None
-    for idx, entry in enumerate(chunk_logprobs[:scan_positions]):
-        if _p_unsafe_from_entry(entry) is not None:
-            return idx
-    return None
 
 
 def _p_unsafe_from_verdict_logprobs(
@@ -1755,19 +1718,18 @@ def _p_unsafe_from_verdict_logprobs(
 
     ``chunk_logprobs`` is the OpenAI ``content`` shape this adapter builds —
     ``({"token", "logprob", "top_logprobs": [{"token", "logprob"}, ...]}, ...)``.
-    Scans the first up-to ``scan_positions`` content tokens for the first whose
-    ``top_logprobs`` carries a ``yes``/``no`` verdict distribution, then
+    Scans the first up-to ``scan_positions`` content tokens for the first sampled
+    ``yes``/``no`` verdict and validates its distribution, then
     renormalises ``exp(lp_yes)/(exp(lp_yes)+exp(lp_no))`` over those two tokens.
     Scanning past position 0 keeps a leading whitespace/punctuation/preamble
     token from hiding the verdict, matching the eval runner's ``content[:3]``
-    scan. ``None`` when no verdict token appears in range (caller keeps raw).
+    scan. ``None`` when no verdict token appears in range.
     """
     if not chunk_logprobs:
         return None
     for entry in chunk_logprobs[:scan_positions]:
-        p_unsafe = _p_unsafe_from_entry(entry)
-        if p_unsafe is not None:
-            return p_unsafe
+        if isinstance(entry, dict) and str(entry.get("token") or "").strip().lower() in ("yes", "no"):
+            return _p_unsafe_from_entry(entry)
     return None
 
 
@@ -1776,19 +1738,23 @@ def _thresholded_verdict(
     guard: dict[str, Any],
     scan_positions: int = _GUARD_VERDICT_SCAN_POSITIONS,
 ) -> str | None:
-    """The guard's thresholded verdict token, or ``None`` to leave output as-is.
+    """The guard's thresholded verdict token, or ``None`` for an invalid verdict.
 
     ``guard`` is ``{"threshold": float, "positive": "Yes", "negative": "No"}``
     (positive/negative default to Yes/No). Returns the ``positive`` label iff
     ``P(unsafe) >= threshold``, else ``negative``; ``None`` when P(unsafe) can't
-    be computed (no verdict logprobs within ``scan_positions``) so the raw model
-    token is preserved.
+    be computed from valid verdict logprobs within ``scan_positions``.
     """
     p_unsafe = _p_unsafe_from_verdict_logprobs(chunk_logprobs, scan_positions)
     if p_unsafe is None:
         return None
     threshold = guard.get("threshold")
-    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+    if (
+        not isinstance(threshold, (int, float))
+        or isinstance(threshold, bool)
+        or not math.isfinite(threshold)
+        or not 0 <= threshold <= 1
+    ):
         return None
     positive = str(guard.get("positive") or "Yes")
     negative = str(guard.get("negative") or "No")

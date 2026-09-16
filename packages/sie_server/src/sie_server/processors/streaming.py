@@ -2095,6 +2095,7 @@ class StreamingProcessor:
         first_text_at: float | None = None
         publish_at = time.monotonic()
         first_yield_done = False
+        first_text_published = False
         terminal_sent = False
         # H6: separate flag for "the terminal we published was
         # ``transport_failure``" — even when the terminal lands on the
@@ -2115,7 +2116,7 @@ class StreamingProcessor:
                 publish_failures.pop(0)
             return len(publish_failures) >= _PUBLISH_FAIL_THRESHOLD
 
-        async def _flush_pending() -> bool:
+        async def _flush_pending(*, progress: bool = False) -> bool:
             """Enqueue any pending coalesced text. Returns False on overflow.
 
             Uses a bounded await (``_CHUNK_PUT_TIMEOUT_S``) so a brief
@@ -2126,17 +2127,18 @@ class StreamingProcessor:
             a gap in the wire sequence (the gateway rejects gaps as a
             stream error).
             """
-            nonlocal seq, pending_count, last_flush_ts
-            if not pending_text:
+            nonlocal seq, pending_count, last_flush_ts, first_text_published
+            if not pending_text and not progress:
                 return True
+            text = "".join(pending_text)
             payload = _encode_chunk(
                 kind="chunk",
                 request_id=request_id,
                 attempt_id=attempt_id,
                 seq=seq,
-                text_delta="".join(pending_text),
+                text_delta=text,
                 done=False,
-                is_first=(seq == 0),
+                is_first=bool(text) and not first_text_published,
                 logprobs=pending_logprobs or None,
             )
             try:
@@ -2144,6 +2146,7 @@ class StreamingProcessor:
             except (asyncio.QueueFull, TimeoutError):
                 return False
             seq += 1
+            first_text_published = first_text_published or bool(text)
             pending_text.clear()
             pending_logprobs.clear()
             pending_count = 0
@@ -2455,8 +2458,8 @@ class StreamingProcessor:
                     pending_logprobs.extend(chunk.logprobs)
 
                 now = time.monotonic()
-                if pending_count >= _FLUSH_MAX_TOKENS or (pending_text and (now - last_flush_ts) >= _FLUSH_INTERVAL_S):
-                    ok = await _flush_pending()
+                if pending_count >= _FLUSH_MAX_TOKENS or seq == 0 or (now - last_flush_ts) >= _FLUSH_INTERVAL_S:
+                    ok = await _flush_pending(progress=True)
                     if not ok:
                         # Flush failed after a bounded await on a non-terminal
                         # chunk — content was dropped. Publish

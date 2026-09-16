@@ -282,12 +282,17 @@ async def test_suppress_thinking_blocks_hides_truncated_reasoning_and_its_logpro
 
     normalized = [chunk async for chunk in suppress_thinking_blocks(source)]
 
-    assert len(normalized) == 1
-    assert normalized[0].done is True
-    assert normalized[0].finish_reason == "length"
-    assert normalized[0].completion_tokens == 2
+    assert len(normalized) == 2
+    assert normalized[0].done is False
     assert normalized[0].text_delta == ""
+    assert normalized[0].is_first is False
     assert normalized[0].logprobs is None
+    assert normalized[1].done is True
+    assert normalized[1].finish_reason == "error"
+    assert normalized[1].error_code == "empty_model_output"
+    assert normalized[1].completion_tokens == 2
+    assert normalized[1].text_delta == ""
+    assert normalized[1].logprobs is None
 
 
 @pytest.mark.asyncio
@@ -436,7 +441,7 @@ async def test_reasoning_consuming_the_whole_budget_stamps_empty_output_error() 
     assert "".join(chunk.text_delta for chunk in normalized) == "\n\n"
     terminal = normalized[-1]
     assert terminal.done is True
-    assert terminal.finish_reason == "length"
+    assert terminal.finish_reason == "error"
     assert terminal.error_code == "empty_model_output"
     assert terminal.error_message is not None
     assert "reasoning" in terminal.error_message

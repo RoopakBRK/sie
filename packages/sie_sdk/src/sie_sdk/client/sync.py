@@ -2360,10 +2360,11 @@ class SIEClient:
                 ``"Qwen/Qwen3-4B-Instruct-2507"`` are normalized to the
                 gateway's SIE-safe path id
                 ``"Qwen__Qwen3-4B-Instruct-2507"`` for this endpoint.
-            prompt: Raw prompt string. Chat-template rendering, if any,
-                is performed by the worker — this surface has no chat-template
-                helpers in the SDK (use the OpenAI SDK against
-                ``/v1/chat/completions`` for chat-shaped requests).
+            prompt: Raw continuation input for text-only requests, passed
+                unchanged without a chat template. Served template settings
+                such as ``enable_thinking`` and ``guardian_config`` do not
+                apply to raw input. Use :meth:`chat_completions` with messages
+                for chat, instruction-based structured output, and guard checks.
             max_new_tokens: Hard cap on output tokens.
             images: Optional native image inputs. When present, the worker
                 renders one user turn containing the images and ``prompt``
@@ -3026,6 +3027,9 @@ class SIEClient:
         These worker-origin digests are distinct from the catalog weights
         revision and :attr:`last_model_revision`; gateway SSE omits the
         ``X-SIE-Model-Revision`` header.
+
+        Text-only prompts are raw continuation input, as in :meth:`generate`.
+        Use :meth:`stream_chat_completions` to apply the served chat template.
         """
         resolved_grammar = validate_generate_grammar(grammar) if grammar is not None else None
         pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)

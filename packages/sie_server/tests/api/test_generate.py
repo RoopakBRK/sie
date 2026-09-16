@@ -393,17 +393,27 @@ class TestGenerateEndpoint:
             ]
             streamed_text = "".join(event.get("text_delta", "") for event in events)
             assert streamed_text == "Visible answer"
+            assert events[0]["text_delta"] == ""
+            assert events[0]["done"] is False
             assert "private reasoning" not in streamed_text
         else:
             assert response.json()["text"] == "Visible answer"
 
     @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "template_kwargs", [{"enable_thinking": False}, {"guardian_config": {"risk_name": "harm"}}]
+    )
     def test_text_only_generate_preserves_legacy_adapter_call_signature(
         self,
         client: TestClient,
         registry: MagicMock,
         stream: bool,
+        template_kwargs: dict[str, object],
     ) -> None:
+        config = _make_config()
+        assert config.tasks.generate is not None
+        config.tasks.generate.chat_template_kwargs = template_kwargs
+        registry.get_config.return_value = config
         legacy_adapter = _LegacyTextGenAdapter()
         registry.get.return_value = legacy_adapter
 
