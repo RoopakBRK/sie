@@ -1657,10 +1657,13 @@ def _guard_verdict_logprobs(event: dict[str, Any]) -> tuple[dict[str, Any], ...]
     if not isinstance(meta, dict):
         return ()
     tokens, top = meta.get("output_token_logprobs"), meta.get("output_top_logprobs")
-    if not isinstance(tokens, list) or not isinstance(top, list) or len(top) < len(tokens):
+    if not isinstance(tokens, list) or not isinstance(top, list):
         return ()
     entries: list[dict[str, Any]] = []
-    for token, alternatives in zip(tokens[:_GUARD_VERDICT_SCAN_POSITIONS], top, strict=False):
+    for index, token in enumerate(tokens[:_GUARD_VERDICT_SCAN_POSITIONS]):
+        if index >= len(top):
+            return ()
+        alternatives = top[index]
         if not isinstance(alternatives, list):
             return ()
         parsed: list[dict[str, Any]] = []
@@ -1672,6 +1675,8 @@ def _guard_verdict_logprobs(event: dict[str, Any]) -> tuple[dict[str, Any], ...]
                 return ()
             parsed.append({"token": raw[2], "logprob": value, "bytes": list(raw[2].encode("utf-8"))})
         entries.append({**parsed[0], "top_logprobs": parsed[1:]})
+        if parsed[0]["token"].strip().lower() in ("yes", "no"):
+            break
     return tuple(entries)
 
 
@@ -1679,13 +1684,13 @@ def _p_unsafe_from_entry(entry: Any) -> float | None:
     """``P(unsafe)`` from one OpenAI-shape content token's ``top_logprobs``.
 
     Renormalises ``exp(lp_yes)/(exp(lp_yes)+exp(lp_no))`` over the ``yes``/``no``
-    verdict tokens in this single position. ``None`` when neither appears.
+    verdict tokens in this single position. Both probabilities are required.
     """
     if not isinstance(entry, dict) or str(entry.get("token") or "").strip().lower() not in ("yes", "no"):
         return None
     lp_yes: float | None = None
     lp_no: float | None = None
-    for top in entry.get("top_logprobs") or []:
+    for top in [entry, *(entry.get("top_logprobs") or [])]:
         if not isinstance(top, dict):
             continue
         tok = str(top.get("token") or "").strip().lower()
@@ -1698,11 +1703,11 @@ def _p_unsafe_from_entry(entry: Any) -> float | None:
             lp_yes = val if lp_yes is None else max(lp_yes, val)
         elif tok == "no":
             lp_no = val if lp_no is None else max(lp_no, val)
-    if lp_yes is None and lp_no is None:
+    if lp_yes is None or lp_no is None:
         return None
-    offset = max(value for value in (lp_yes, lp_no) if value is not None)
-    ey = math.exp(lp_yes - offset) if lp_yes is not None else 0.0
-    en = math.exp(lp_no - offset) if lp_no is not None else 0.0
+    offset = max(lp_yes, lp_no)
+    ey = math.exp(lp_yes - offset)
+    en = math.exp(lp_no - offset)
     return ey / (ey + en) if (ey + en) > 0 else None
 
 
@@ -1713,8 +1718,8 @@ def _p_unsafe_from_verdict_logprobs(
 
     ``chunk_logprobs`` is the OpenAI ``content`` shape this adapter builds —
     ``({"token", "logprob", "top_logprobs": [{"token", "logprob"}, ...]}, ...)``.
-    Scans the first up-to ``scan_positions`` content tokens for the first whose
-    ``top_logprobs`` carries a ``yes``/``no`` verdict distribution, then
+    Scans the first up-to ``scan_positions`` content tokens for the first sampled
+    ``yes``/``no`` verdict and validates its distribution, then
     renormalises ``exp(lp_yes)/(exp(lp_yes)+exp(lp_no))`` over those two tokens.
     Scanning past position 0 keeps a leading whitespace/punctuation/preamble
     token from hiding the verdict, matching the eval runner's ``content[:3]``
@@ -1723,9 +1728,8 @@ def _p_unsafe_from_verdict_logprobs(
     if not chunk_logprobs:
         return None
     for entry in chunk_logprobs[:scan_positions]:
-        p_unsafe = _p_unsafe_from_entry(entry)
-        if p_unsafe is not None:
-            return p_unsafe
+        if isinstance(entry, dict) and str(entry.get("token") or "").strip().lower() in ("yes", "no"):
+            return _p_unsafe_from_entry(entry)
     return None
 
 

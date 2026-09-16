@@ -2509,18 +2509,18 @@ def test_guard_missing_verdict_distribution_is_typed_error(mock_async_client: Ma
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), 0.1, True, "-0.1"])
 def test_guard_invalid_verdict_probability_cannot_be_safe(invalid: Any) -> None:
-    logprobs = ({"token": "No", "top_logprobs": [_lp("Yes", invalid), _lp("No", -0.1)]},)
+    logprobs = ({"token": "No", "logprob": -0.1, "top_logprobs": [_lp("Yes", invalid), _lp("No", -0.1)]},)
     assert _thresholded_verdict(logprobs, {"threshold": 0.5}) is None
 
 
 @pytest.mark.parametrize("threshold", [float("nan"), float("inf"), -0.1, 1.1, True, "0.5"])
 def test_guard_invalid_threshold_cannot_be_safe(threshold: Any) -> None:
-    logprobs = ({"token": "Yes", "top_logprobs": [_lp("Yes", -0.5), _lp("No", -0.5)]},)
+    logprobs = ({"token": "Yes", "logprob": -0.5, "top_logprobs": [_lp("Yes", -0.5), _lp("No", -0.5)]},)
     assert _thresholded_verdict(logprobs, {"threshold": threshold}) is None
 
 
 def test_guard_very_small_probabilities_are_normalized_without_underflow() -> None:
-    logprobs = ({"token": "Yes", "top_logprobs": [_lp("Yes", -1000), _lp("No", -1001)]},)
+    logprobs = ({"token": "Yes", "logprob": -1000, "top_logprobs": [_lp("Yes", -1000), _lp("No", -1001)]},)
     assert _thresholded_verdict(logprobs, {"threshold": 0.5}) == "Yes"
 
 
@@ -2576,3 +2576,64 @@ def test_guard_malformed_wire_probability_fails_closed(
     assert chunks[-1].error_code == "invalid_guard_verdict"
     assert chunks[-1].finish_reason == "error"
     assert not any(c.text_delta for c in chunks)
+
+
+@pytest.mark.parametrize("malformed_tail", ["sampled", "alternative", "missing_top", "malformed_top"])
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_valid_verdict_ignores_malformed_trailing_metadata(
+    mock_async_client: MagicMock, malformed_tail: str
+) -> None:
+    tokens = [_sglang_token("Yes", -0.1), _sglang_token(" because", -0.2)]
+    top: list[Any] = [_guard_top(yes=-0.1, no=-3), _guard_top(filler=" because")]
+    if malformed_tail == "sampled":
+        tokens[1][0] = True
+    elif malformed_tail == "alternative":
+        top[1][0][0] = "-0.1"
+    elif malformed_tail == "missing_top":
+        top.pop()
+    else:
+        top[1] = None
+    lines = [_guard_event("Yes because", tokens, top, terminal=True)]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(lines))
+    chunks = _drive_guard(_guard_adapter(), lines, logprobs=True)
+    assert "".join(chunk.text_delta for chunk in chunks) == "Yes"
+    assert chunks[-1].error_code is None
+    assert all(chunk.logprobs is None for chunk in chunks)
+
+
+@pytest.mark.parametrize(("sampled", "opposing"), [("Yes", "No"), ("No", "Yes")])
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_uses_sampled_probability_when_absent_from_top_alternatives(
+    mock_async_client: MagicMock, sampled: str, opposing: str
+) -> None:
+    lines = [_guard_event(sampled, [_sglang_token(sampled, -0.1)], [[_sglang_token(opposing, -3)]], terminal=True)]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(lines))
+    chunks = _drive_guard(_guard_adapter(), lines)
+    assert "".join(chunk.text_delta for chunk in chunks) == sampled
+    assert chunks[-1].error_code is None
+
+
+@pytest.mark.parametrize("sampled", ["Yes", "No"])
+@pytest.mark.parametrize("later_verdict", [False, True])
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_missing_opposing_probability_fails_closed(
+    mock_async_client: MagicMock, sampled: str, later_verdict: bool
+) -> None:
+    tokens = [_sglang_token(sampled, -0.1)]
+    top = [[_sglang_token(sampled, -0.1)]]
+    if later_verdict:
+        tokens.append(_sglang_token("No", -0.1))
+        top.append(_guard_top(yes=-3, no=-0.1))
+    lines = [_guard_event(sampled, tokens, top, terminal=True)]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(lines))
+    chunks = _drive_guard(_guard_adapter(), lines)
+    assert chunks[-1].error_code == "invalid_guard_verdict"
+    assert not any(chunk.text_delta for chunk in chunks)
+
+
+def test_guard_first_sampled_verdict_requires_complete_evidence() -> None:
+    later_safe = {"token": "No", "logprob": -0.1, "top_logprobs": [_lp("Yes", -3), _lp("No", -0.1)]}
+    incomplete_yes = {"token": "Yes", "logprob": -0.1, "top_logprobs": [_lp("Yes", -0.1)]}
+    assert _p_unsafe_from_verdict_logprobs((incomplete_yes, later_safe)) is None
+    missing_sampled = {"token": "Yes", "top_logprobs": [_lp("Yes", -0.1), _lp("No", -3)]}
+    assert _p_unsafe_from_verdict_logprobs((missing_sampled, later_safe)) is None
