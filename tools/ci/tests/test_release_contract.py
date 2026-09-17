@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from tools.ci import check_release_contract as contract
+from tools.ci import release_openapi
 
 
 def run_audio_uploader(
@@ -110,6 +111,194 @@ def test_release_please_rejects_any_other_bootstrap_boundary(monkeypatch, bootst
 
     monkeypatch.setattr(contract, "load_json", load_json)
     assert "release-please bootstrap-sha must be the exact public v0.7.3 commit" in contract.release_config_errors()
+
+
+def openapi_surfaces() -> tuple[str, str, set[str]]:
+    refresh = contract.workflow_job_blocks(".github/workflows/release.yml")["release-please"]
+    contracts = contract.workflow_job_blocks(".github/workflows/ci.yml")["contracts"]
+    return refresh, contracts, set(release_openapi.OPENAPI_VERSION_SOURCES)
+
+
+@pytest.mark.parametrize("document", sorted(contract.OPENAPI_VERSION_PATHS))
+def test_release_pr_stamps_every_openapi_version_ci_regenerates(document) -> None:
+    refresh, contracts, stamped = openapi_surfaces()
+    assert contract.release_openapi_errors(refresh, contracts, stamped) == []
+
+    assert contract.release_openapi_errors(refresh, contracts, stamped - {document})
+    assert contract.release_openapi_errors(refresh, contracts.replace(document, ""), stamped)
+    for command in ("git diff --quiet --", "git add"):
+        unstaged = re.sub(rf"({re.escape(command)} .*) {re.escape(document)}", r"\1", refresh)
+        assert unstaged != refresh
+        assert contract.release_openapi_errors(unstaged, contracts, stamped)
+    unstamped = refresh.replace(contract.OPENAPI_STAMP_COMMAND, "")
+    assert contract.release_openapi_errors(unstamped, contracts, stamped)
+
+
+@pytest.mark.parametrize(
+    ("anchor", "offset", "valid"),
+    [
+        ('git checkout -B "$branch" FETCH_HEAD', 1, True),
+        ("mise exec -- cargo metadata", 1, True),
+        ('git checkout -B "$branch" FETCH_HEAD', 0, False),
+        ("git diff --quiet --", 1, False),
+        ("git add ", 1, False),
+    ],
+)
+def test_release_pr_stamps_openapi_versions_after_checkout_and_before_commit(anchor, offset, valid) -> None:
+    refresh, contracts, stamped = openapi_surfaces()
+    lines = refresh.splitlines()
+    stamp = next(line for line in lines if line.strip() == contract.OPENAPI_STAMP_COMMAND)
+    lines.remove(stamp)
+    lines.insert(next(index for index, line in enumerate(lines) if anchor in line) + offset, stamp)
+    assert (contract.release_openapi_errors("\n".join(lines), contracts, stamped) == []) is valid
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        f"{contract.OPENAPI_STAMP_COMMAND} || true",
+        f"# {contract.OPENAPI_STAMP_COMMAND}",
+        contract.OPENAPI_STAMP_COMMAND.replace(" -I ", " "),
+    ],
+)
+def test_release_pr_stamp_fails_closed_in_isolated_python(stamp) -> None:
+    refresh, contracts, stamped = openapi_surfaces()
+    weakened = refresh.replace(contract.OPENAPI_STAMP_COMMAND, stamp)
+    assert weakened != refresh
+    assert contract.release_openapi_errors(weakened, contracts, stamped)
+
+
+def line_index(lines: list[str], text: str) -> int:
+    return next(index for index, line in enumerate(lines) if text in line)
+
+
+def duplicate_diff_check(lines: list[str]) -> None:
+    start = line_index(lines, "git diff --quiet --")
+    lines[start:start] = lines[start : start + 3]
+
+
+def duplicate_staging(lines: list[str]) -> None:
+    stage = line_index(lines, "git add ")
+    lines.insert(stage, lines[stage])
+
+
+def move_before(lines: list[str], moved: str, anchor: str) -> None:
+    line = lines.pop(line_index(lines, moved))
+    lines.insert(line_index(lines, anchor), line)
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        duplicate_diff_check,
+        duplicate_staging,
+        lambda lines: move_before(lines, "git add ", "git diff --quiet --"),
+        lambda lines: move_before(lines, "git commit ", "git add "),
+        lambda lines: move_before(lines, "git push origin ", "git commit "),
+    ],
+    ids=["duplicate-diff", "duplicate-add", "add-before-diff", "commit-before-add", "push-before-commit"],
+)
+def test_release_pr_refresh_diffs_adds_commits_and_pushes_once_in_order(rewrite) -> None:
+    refresh, contracts, stamped = openapi_surfaces()
+    lines = refresh.splitlines()
+    rewrite(lines)
+    assert lines != refresh.splitlines()
+    assert contract.release_openapi_errors("\n".join(lines), contracts, stamped)
+
+
+REFRESH_RUN = "        run: |\n          set -euo pipefail\n          branch="
+
+
+@pytest.mark.parametrize(
+    ("surface", "old", "new"),
+    [
+        ("contracts", "- run: mise run openapi\n", "# - run: mise run openapi\n"),
+        ("contracts", "- run: mise run openapi\n", "- run: echo mise run openapi\n"),
+        ("contracts", "- run: mise run openapi\n", "- run: mise run openapi\n        if: false\n"),
+        ("contracts", "packages/sie_gateway/openapi.json\n", "packages/sie_gateway/openapi.json\n          || true\n"),
+        (
+            "contracts",
+            "packages/sie_gateway/openapi.json\n",
+            "packages/sie_gateway/openapi.json\n        continue-on-error: true\n",
+        ),
+        ("contracts", "    timeout-minutes: 25\n", "    timeout-minutes: 25\n    continue-on-error: true\n"),
+        ("refresh", "if git diff --quiet --", "if echo git diff --quiet --"),
+        ("refresh", "git add uv.lock", "git add --dry-run uv.lock"),
+        ("refresh", "packages/sie_gateway/openapi.json\n", "packages/sie_gateway/openapi.json || true\n"),
+        ("refresh", "OpenAPI versions'\n", "OpenAPI versions' || true\n"),
+        ("refresh", '"HEAD:refs/heads/$branch"\n', '"HEAD:refs/heads/$branch" || true\n'),
+        ("refresh", f"{contract.OPENAPI_STAMP_COMMAND}\n", f"set +e\n          {contract.OPENAPI_STAMP_COMMAND}\n"),
+        ("refresh", f"{contract.OPENAPI_STAMP_COMMAND}\n", f"exit 0\n          {contract.OPENAPI_STAMP_COMMAND}\n"),
+        ("refresh", REFRESH_RUN, f"        continue-on-error: true\n{REFRESH_RUN}"),
+        ("refresh", REFRESH_RUN, f"        shell: bash {{0}}\n{REFRESH_RUN}"),
+    ],
+    ids=[
+        "commented-regeneration",
+        "echoed-regeneration",
+        "skipped-regeneration",
+        "diff-or-true",
+        "diff-continue-on-error",
+        "contracts-job-continue-on-error",
+        "echoed-refresh-diff",
+        "dry-run-add",
+        "add-or-true",
+        "commit-or-true",
+        "push-or-true",
+        "set-plus-e",
+        "early-exit",
+        "refresh-continue-on-error",
+        "refresh-shell-without-errexit",
+    ],
+)
+def test_release_openapi_contract_rejects_inactive_or_suppressed_commands(surface, old, new) -> None:
+    refresh, contracts, stamped = openapi_surfaces()
+    surfaces = {"refresh": refresh, "contracts": contracts}
+    assert surfaces[surface].count(old) == 1
+    surfaces[surface] = surfaces[surface].replace(old, new)
+    assert contract.release_openapi_errors(surfaces["refresh"], surfaces["contracts"], stamped)
+
+
+@pytest.mark.parametrize(
+    ("opened", "closed"),
+    [("if false; then", "fi"), ("while false; do", "done")],
+    ids=["if-false", "while-false"],
+)
+def test_release_pr_refresh_rejects_inactive_shell_wrappers(opened, closed) -> None:
+    refresh, contracts, stamped = openapi_surfaces()
+    opening = f"        run: |\n          set -euo pipefail\n          {opened}\n          branch="
+    wrapped = refresh.replace(REFRESH_RUN, opening).replace(
+        '"HEAD:refs/heads/$branch"\n', f'"HEAD:refs/heads/$branch"\n          {closed}\n'
+    )
+    assert wrapped != refresh
+    assert contract.release_openapi_errors(wrapped, contracts, stamped)
+
+
+def test_release_pr_refresh_rejects_commands_moved_into_another_step() -> None:
+    refresh, contracts, stamped = openapi_surfaces()
+    lines = refresh.splitlines()
+    lines.insert(line_index(lines, 'pr_number="$(jq'), lines.pop(line_index(lines, "git push origin")))
+    moved = "\n".join(lines)
+    assert moved != refresh
+    assert contract.release_openapi_errors(moved, contracts, stamped)
+
+
+@pytest.mark.parametrize("document", sorted(contract.OPENAPI_VERSION_PATHS))
+def test_release_please_must_not_rewrite_generated_openapi(monkeypatch, document) -> None:
+    real_load_json = contract.load_json
+
+    def load_json(path):
+        loaded = real_load_json(path)
+        if path == "release-please-config.json":
+            loaded = deepcopy(loaded)
+            extra_file = {"type": "json", "path": document, "jsonpath": "$.info.version"}
+            loaded["packages"]["."]["extra-files"].append(extra_file)
+        return loaded
+
+    monkeypatch.setattr(contract, "load_json", load_json)
+    monkeypatch.setattr(contract, "EXTRA_VERSION_PATHS", contract.EXTRA_VERSION_PATHS | {document})
+    assert contract.release_config_errors() == [
+        "generated OpenAPI documents must be stamped, not rewritten by release-please"
+    ]
 
 
 def test_option_ext_mpl_exception_is_exact_and_cannot_broaden() -> None:

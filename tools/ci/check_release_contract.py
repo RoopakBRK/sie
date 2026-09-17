@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from tools.ci import distributions
+from tools.ci import distributions, release_openapi
 from tools.ci.release_guard import SEED_VERSION, stable_version
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +73,50 @@ EXTRA_VERSION_PATHS = {
     "packages/sie_audio_prep/build_wheel.py",
     "deploy/helm/sie-cluster/Chart.yaml",
 }
+OPENAPI_VERSION_PATHS = {
+    "packages/sie_server/openapi.json",
+    "packages/sie_gateway/openapi.json",
+}
+OPENAPI_STAMP_COMMAND = "mise exec -- python -I tools/ci/release_openapi.py"
+PLAIN_PATHS = r"((?:[\w.][\w./-]* )*[\w.][\w./-]*)"
+CONTRACTS_OPENAPI_COMMANDS = (
+    ("mise run openapi", re.compile(re.escape("- run: mise run openapi"))),
+    ("git diff", re.compile(rf"- run: git diff --exit-code -- {PLAIN_PATHS}")),
+)
+REFRESH_OPENAPI_COMMANDS = (
+    ("git checkout", re.compile(re.escape('git checkout -B "$branch" FETCH_HEAD'))),
+    ("tools/ci/release_openapi.py", re.compile(re.escape(OPENAPI_STAMP_COMMAND))),
+    ("git diff", re.compile(rf"if git diff --quiet -- {PLAIN_PATHS}; then")),
+    ("git add", re.compile(rf"git add {PLAIN_PATHS}")),
+    ("git commit", re.compile(r"git commit -m '[^'\\]*'")),
+    ("git push", re.compile(re.escape('git push origin "HEAD:refs/heads/$branch"'))),
+)
+SHELL_CONTROL_FLOW = frozenset(
+    {
+        "if",
+        "elif",
+        "else",
+        "fi",
+        "while",
+        "until",
+        "for",
+        "do",
+        "done",
+        "case",
+        "esac",
+        "function",
+        "exit",
+        "return",
+        "trap",
+        "eval",
+        "source",
+        ".",
+        "{",
+        "}",
+        "(",
+        ")",
+    }
+)
 ACTION_PIN = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 JOB_FIELD_INDENT = 4
 ARTIFACT_RETENTION_DAYS = 30
@@ -329,6 +373,95 @@ def release_config_errors() -> list[str]:
     for path in extra_paths:
         if not (ROOT / path).is_file():
             errors.append(f"release-please extra file does not exist: {path}")
+    if extra_paths & OPENAPI_VERSION_PATHS:
+        errors.append("generated OpenAPI documents must be stamped, not rewritten by release-please")
+    errors.extend(
+        release_openapi_errors(
+            workflow_job_blocks(".github/workflows/release.yml").get("release-please", ""),
+            workflow_job_blocks(".github/workflows/ci.yml").get("contracts", ""),
+            set(release_openapi.OPENAPI_VERSION_SOURCES),
+        )
+    )
+    return errors
+
+
+def step_lines(block: str) -> list[str]:
+    """Strip workflow lines, joining each folded `>-` scalar onto its key line."""
+    lines: list[str] = []
+    continuation: int | None = None
+    for raw in block.splitlines():
+        indent = len(raw) - len(raw.lstrip())
+        if continuation is not None and raw.strip() and indent >= continuation:
+            lines[-1] = f"{lines[-1]} {raw.strip()}"
+            continue
+        continuation = None
+        line = raw.strip()
+        if line.endswith(": >-"):
+            continuation = indent + (4 if line.startswith("- ") else 2)
+            line = line.removesuffix(" >-")
+        lines.append(line)
+    return lines
+
+
+def exact_commands(
+    lines: list[str], commands: tuple[tuple[str, re.Pattern[str]], ...]
+) -> list[tuple[int, re.Match[str]]] | None:
+    """Match each command on the only line that mentions it, requiring the commands in order."""
+    found: list[tuple[int, re.Match[str]]] = []
+    for marker, command in commands:
+        indexes = [index for index, line in enumerate(lines) if marker in line]
+        match = command.fullmatch(lines[indexes[0]]) if len(indexes) == 1 else None
+        if match is None or (found and indexes[0] <= found[-1][0]):
+            return None
+        found.append((indexes[0], match))
+    return found
+
+
+def step_bounds(lines: list[str], index: int) -> tuple[int, int]:
+    """Return the line range of the workflow step holding the given line."""
+    start = next((position for position in range(index, -1, -1) if lines[position].startswith("- ")), 0)
+    end = next((position for position in range(index + 1, len(lines)) if lines[position].startswith("- ")), len(lines))
+    return start, end
+
+
+def refresh_control_flow(lines: list[str], commands: list[tuple[int, re.Match[str]]]) -> list[str]:
+    """Return the shell control-flow lines of every step that runs one of the commands."""
+    steps = sorted({step_bounds(lines, index) for index, _ in commands})
+    shell = [line for start, end in steps for line in lines[start:end]]
+    return [line for line in shell if line.split(" ")[0].removesuffix(";") in SHELL_CONTROL_FLOW]
+
+
+def release_openapi_errors(refresh: str, contracts: str, stamped: set[str]) -> list[str]:
+    def documents(match: re.Match[str]) -> set[str]:
+        return set(re.findall(r"[\w/]+/openapi\.json", match.group(1)))
+
+    def ends_step(lines: list[str], index: int) -> bool:
+        return index + 1 == len(lines) or not lines[index + 1] or lines[index + 1].startswith("- ")
+
+    errors: list[str] = []
+    if stamped != OPENAPI_VERSION_PATHS:
+        errors.append("release OpenAPI version stamping differs from the public contract")
+    contract_lines = step_lines(contracts)
+    regenerated = exact_commands(contract_lines, CONTRACTS_OPENAPI_COMMANDS)
+    if (
+        regenerated is None
+        or documents(regenerated[-1][1]) != OPENAPI_VERSION_PATHS
+        or not all(ends_step(contract_lines, index) for index, _ in regenerated)
+        or any(line.startswith("continue-on-error") for line in contract_lines)
+    ):
+        errors.append("CI / Contracts must regenerate and then diff exactly the stamped OpenAPI documents")
+    refresh_lines = step_lines(refresh)
+    refreshed = exact_commands(refresh_lines, REFRESH_OPENAPI_COMMANDS)
+    if (
+        refreshed is None
+        or any(documents(match) != OPENAPI_VERSION_PATHS for _, match in refreshed[2:4])
+        or any(line.startswith(("set +", "shell:", "continue-on-error")) for line in refresh_lines)
+        or refresh_control_flow(refresh_lines, refreshed) != [refresh_lines[refreshed[2][0]], "exit 0", "fi"]
+    ):
+        errors.append(
+            "release PR refresh must run checkout, OpenAPI stamp, diff, add, commit, and push once each, "
+            "in order, as exact commands without failure suppression"
+        )
     return errors
 
 
