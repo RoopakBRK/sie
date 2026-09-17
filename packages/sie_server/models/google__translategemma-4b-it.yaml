@@ -11,14 +11,14 @@ tasks:
   score: null
   extract: null
   generate:
-    context_length: 4096
+    context_length: 2560
     max_output_tokens: 512
     capabilities:
       grammar: []
       streaming: true
       tools: false
     chat_template_kwargs: {}
-max_sequence_length: 4096
+max_sequence_length: 2560
 profiles:
   default:
     max_batch_tokens: 8192
