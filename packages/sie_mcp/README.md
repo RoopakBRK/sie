@@ -397,4 +397,7 @@ For hosted deployments, export the public origin before starting the MCP edge:
 export SIE_MCP_PUBLIC_URL='https://mcp.example.com'
 ```
 
-This ensures that OAuth metadata contains stable public URLs.
+The OAuth metadata advertises this origin as the authorization server, so pin it
+on every exposed deployment. Unpinned, the edge serves OAuth metadata only when the
+request `Host` is loopback or listed in `SIE_MCP_ALLOWED_HOSTS`, and ignores
+`X-Forwarded-Host`.
