@@ -30,6 +30,7 @@ profiles:
         served_model_name: google/translategemma-4b-it
         mem_fraction_static: 0.85
         grammar_backend: xgrammar
+        attention_backend: triton
         trust_remote_code: false
       runtime:
         first_chunk_timeout_s: 180
