@@ -1,4 +1,5 @@
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from sie_mcp.auth import ConnectorSecretAuthMiddleware, authenticate, base_url, bearer_token
@@ -137,6 +138,63 @@ def test_base_url_ignores_forwarded_headers() -> None:
 def test_base_url_refuses_untrusted_host(host: str) -> None:
     cfg = _cfg(public_base_url=None, allowed_hosts=["mcp.example.com", "edge.example.com:*"])
     assert base_url(cfg, scheme="https", headers=Headers({"host": host})) is None
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # Extra authority after the port.
+        "edge.example.com:8443@evil.attacker.example",
+        "edge.example.com:8443/evil",
+        # Not ports.
+        "edge.example.com:99999",
+        "edge.example.com:0",
+        "edge.example.com:abc",
+        "edge.example.com:",
+    ],
+)
+def test_base_url_refuses_wildcard_host_without_a_valid_port(host: str) -> None:
+    cfg = _cfg(public_base_url=None, allowed_hosts=["edge.example.com:*"])
+    assert base_url(cfg, scheme="https", headers=Headers({"host": host})) is None
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # Loopback is trusted without configuration, so a Host that merely starts
+        # with a loopback name must not inherit that trust.
+        "localhost:8088@evil.attacker.example",
+        "127.0.0.1:8088@evil.attacker.example",
+        "[::1]@evil.attacker.example",
+        "[::1]:8088@evil.attacker.example",
+        "[::1].evil.attacker.example",
+        "localhost:8088/evil",
+        "localhost:99999",
+    ],
+)
+def test_base_url_refuses_loopback_lookalike_hosts(host: str) -> None:
+    cfg = _cfg(public_base_url=None, allowed_hosts=[])
+    assert base_url(cfg, scheme="https", headers=Headers({"host": host})) is None
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "edge.example.com:8443",
+        "edge.example.com:8443@evil.attacker.example",
+        "edge.example.com:8443/evil",
+        "evil.attacker.example",
+    ],
+)
+def test_advertised_origin_never_resolves_to_an_unconfigured_host(host: str) -> None:
+    """Whatever is advertised must parse back to a host the operator configured."""
+    cfg = _cfg(public_base_url=None, allowed_hosts=["edge.example.com:*"])
+    origin = base_url(cfg, scheme="https", headers=Headers({"host": host}))
+    if origin is None:
+        return
+    metadata = f"{origin}/.well-known/oauth-protected-resource"
+    assert urlsplit(metadata).hostname == "edge.example.com"
+    assert urlsplit(metadata).path == "/.well-known/oauth-protected-resource"
 
 
 @pytest.mark.parametrize(
