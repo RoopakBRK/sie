@@ -262,7 +262,11 @@ def test_metadata_handles_malformed_ipv6_host(path: str, pinned: bool) -> None:
     assert resp.status_code == (200 if pinned else 503)
     assert "[::::]" not in resp.text
     if pinned:
-        assert "https://mcp.example.com" in resp.text
+        body = resp.json()
+        if "issuer" in body:
+            assert body["issuer"] == "https://mcp.example.com"
+        else:
+            assert body["authorization_servers"] == ["https://mcp.example.com"]
 
 
 def test_metadata_served_for_loopback_host_when_unpinned() -> None:
