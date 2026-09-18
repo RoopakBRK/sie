@@ -247,6 +247,28 @@ def test_metadata_refused_for_untrusted_host_when_unpinned(path: str) -> None:
     assert "mcp.example.com" not in resp.text
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ],
+)
+@pytest.mark.parametrize("pinned", [False, True])
+def test_metadata_handles_malformed_ipv6_host(path: str, pinned: bool) -> None:
+    cfg = _cfg(public_base_url="https://mcp.example.com" if pinned else None, allowed_hosts=["[::::]:*"])
+    resp = _client(cfg).get(path, headers={"host": "[::::]:443"})
+    assert resp.status_code == (200 if pinned else 503)
+    assert "[::::]" not in resp.text
+    if pinned:
+        body = resp.json()
+        if "issuer" in body:
+            assert body["issuer"] == "https://mcp.example.com"
+        else:
+            assert body["authorization_servers"] == ["https://mcp.example.com"]
+
+
 def test_metadata_served_for_loopback_host_when_unpinned() -> None:
     body = _client(_cfg(), base_url="http://localhost:8088").get("/.well-known/oauth-authorization-server").json()
     assert body["issuer"] == "http://localhost:8088"

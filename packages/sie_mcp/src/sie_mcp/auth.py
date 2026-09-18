@@ -9,6 +9,8 @@ Implemented as pure ASGI (not ``BaseHTTPMiddleware``) so it does not buffer the
 streaming MCP responses.
 """
 
+import re
+from ipaddress import IPv6Address
 from typing import Any
 
 from starlette.datastructures import Headers
@@ -35,19 +37,53 @@ _EXEMPT_PATHS = frozenset(
 
 _LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "[::1]"})
 
+_MAX_PORT = 65535
 
-def _hostname(host: str) -> str:
-    if host.startswith("["):
-        return host[: host.find("]") + 1]
-    return host.rsplit(":", 1)[0]
+# RFC 9110 s7.2: a Host header is "uri-host [ ':' port ]" and carries no userinfo,
+# path, query, or fragment.
+_HOST_RE = re.compile(
+    r"""
+    \A
+    (?:
+        \[(?P<ipv6>[0-9a-f:.]+)\]
+      | (?P<regname>[0-9a-z._~!$&'()*+,;=%-]+)
+    )
+    (?::(?P<port>[0-9]{1,5}))?
+    \Z
+    """,
+    re.VERBOSE,
+)
+
+
+def _split_host_port(host: str) -> tuple[str, str | None] | None:
+    """Split a lowercased ``Host`` into ``(hostname, port)``, or ``None`` if malformed."""
+    match = _HOST_RE.fullmatch(host)
+    if match is None:
+        return None
+    port = match["port"]
+    if port is not None and not 1 <= int(port) <= _MAX_PORT:
+        return None
+    ipv6 = match["ipv6"]
+    if ipv6 is not None:
+        try:
+            IPv6Address(ipv6)
+        except ValueError:
+            return None
+    return (f"[{ipv6}]" if ipv6 is not None else match["regname"]), port
 
 
 def _host_trusted(config: MCPConfig, host: str) -> bool:
     host = host.lower()
-    if _hostname(host) in _LOOPBACK_HOSTNAMES:
+    parsed = _split_host_port(host)
+    if parsed is None:
+        return False
+    hostname, port = parsed
+    if hostname in _LOOPBACK_HOSTNAMES:
         return True
     for allowed in (entry.lower() for entry in config.allowed_hosts):
-        if host == allowed or (allowed.endswith(":*") and host.startswith(allowed[:-1])):
+        if host == allowed:
+            return True
+        if allowed.endswith(":*") and port is not None and hostname == allowed[:-2]:
             return True
     return False
 
