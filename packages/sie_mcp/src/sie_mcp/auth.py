@@ -10,6 +10,7 @@ streaming MCP responses.
 """
 
 import re
+from ipaddress import IPv6Address
 from typing import Any
 
 from starlette.datastructures import Headers
@@ -63,6 +64,11 @@ def _split_host_port(host: str) -> tuple[str, str | None] | None:
     if port is not None and not 1 <= int(port) <= _MAX_PORT:
         return None
     ipv6 = match["ipv6"]
+    if ipv6 is not None:
+        try:
+            IPv6Address(ipv6)
+        except ValueError:
+            return None
     return (f"[{ipv6}]" if ipv6 is not None else match["regname"]), port
 
 

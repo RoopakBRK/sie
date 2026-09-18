@@ -177,6 +177,21 @@ def test_base_url_refuses_loopback_lookalike_hosts(host: str) -> None:
     assert base_url(cfg, scheme="https", headers=Headers({"host": host})) is None
 
 
+@pytest.mark.parametrize("literal", ["::::", "1:2:3", "12345::1", "::ffff:192.0.2.999"])
+@pytest.mark.parametrize("allowed_port", ["443", "*"])
+def test_base_url_refuses_malformed_ipv6_even_when_allowed(literal: str, allowed_port: str) -> None:
+    cfg = _cfg(public_base_url=None, allowed_hosts=[f"[{literal}]:{allowed_port}"])
+    assert base_url(cfg, scheme="https", headers=Headers({"host": f"[{literal}]:443"})) is None
+
+
+@pytest.mark.parametrize("literal", ["2001:db8::1", "::ffff:192.0.2.1"])
+@pytest.mark.parametrize("allowed_port", ["443", "*"])
+def test_base_url_trusts_valid_allowed_ipv6(literal: str, allowed_port: str) -> None:
+    cfg = _cfg(public_base_url=None, allowed_hosts=[f"[{literal}]:{allowed_port}"])
+    host = f"[{literal}]:443"
+    assert base_url(cfg, scheme="https", headers=Headers({"host": host})) == f"https://{host}"
+
+
 @pytest.mark.parametrize(
     "host",
     [
