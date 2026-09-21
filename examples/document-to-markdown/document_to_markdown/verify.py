@@ -2,7 +2,7 @@
 
 Why this exists
 ---------------
-``evaluate.py`` scores ``runs/<id>/markdown/<slug>.md`` and never opens the
+``evaluate.py`` scores ``<run>/markdown/<slug>.md`` and never opens the
 recorded response beside it. That gap was found by running this example: the
 Markdown file the checks read is written by the harness itself, so editing that
 file alone would make all 25 checks pass while the recorded API response said
@@ -33,7 +33,7 @@ from typing import Any
 from rich.console import Console
 
 from document_to_markdown.canonical import canonical_sha256
-from document_to_markdown.config import DATA_DIR, PDF_DIR
+from document_to_markdown.config import PDF_DIR, ROOT, is_fetched_bundle
 
 console = Console()
 
@@ -43,11 +43,48 @@ class VerificationError(Exception):
 
 
 def _read_json(path: Path) -> Any:
+    if not path.exists():
+        # A file the verifier needs and cannot find is a failure, never a skip.
+        # Reporting it as one check that could not run would leave the total
+        # reading as a pass.
+        raise VerificationError(f"{path} is missing. Run: python3 fetch.py")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _check(results: list[tuple[bool, str]], ok: bool, message: str) -> None:
     results.append((ok, message))
+
+
+def _relative(path: Path) -> str:
+    """The path as the README names it, for a check message."""
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def sources_manifest_for(run_dir: Path) -> Path:
+    """Where the provenance for THIS run's source PDFs lives.
+
+    A bundle fetched from the dataset carries its own under
+    ``inputs/sources.json``, describing the PDFs that run actually read. A
+    bundle produced locally by ``convert-documents`` carries none, so the
+    manifest ``fetch-documents`` wrote beside the PDFs is the one that
+    describes what it read.
+
+    A fixed path would check a local run against somebody else's provenance,
+    which is the same shape as the duplicate-slug problem below: two checks
+    reading rows that were never about the same file.
+
+    Which bundle this is decides the answer, never whether the file happens to
+    be there. A fetched bundle missing its ``inputs/sources.json`` gets that
+    path back regardless, so the presence check fails; falling back would let
+    whatever PDFs are sitting in ``pdfs/`` satisfy the provenance checks for a
+    different set of artifacts, which is the failure this join exists to
+    prevent. A local bundle with no PDF manifest fails the same way.
+    """
+    bundled = run_dir / "inputs" / "sources.json"
+    return bundled if is_fetched_bundle(run_dir) else PDF_DIR / "manifest.json"
 
 
 def _resolve_payloads(value: Any, run_dir: Path, results: list[tuple[bool, str]]) -> Any:
@@ -91,7 +128,7 @@ def verify_run(run_dir: Path) -> tuple[list[tuple[bool, str]], list[str]]:
     """Return (check results, slugs whose PDF digest check could not run)."""
     results: list[tuple[bool, str]] = []
     not_checked: list[str] = []
-    manifest = _read_json(run_dir / "manifest.json")
+    manifest = _read_json(run_dir / "run-manifest.json")
     calls_document = _read_json(run_dir / "calls.json")
 
     recorded_manifest_digest = manifest.pop("manifest_sha256", None)
@@ -228,16 +265,17 @@ def verify_run(run_dir: Path) -> tuple[list[tuple[bool, str]], list[str]]:
         )
         console.print(f"[bold]Recomputed from the check arrays: {passed} of {total} checks passed[/]")
 
-    sources_path = DATA_DIR / "manifest.json"
+    sources_path = sources_manifest_for(run_dir)
+    sources_label = _relative(sources_path)
     # Required, and every scored document must appear in it. Treating either as
     # optional let a missing file or a missing row skip the provenance check
     # while the run still reported success -- the third time that shape has
     # appeared in this module, and the second time I wrote it myself.
-    _check(results, sources_path.exists(), "data/manifest.json is present")
+    _check(results, sources_path.exists(), f"{sources_label} is present")
     if sources_path.exists():
         sources = _read_json(sources_path)
         # Fourth member of the same class, and the finding did not name it:
-        # data/manifest.json is a slug-keyed row list too. It has no first/last
+        # The sources manifest is a slug-keyed row list too. It has no first/last
         # asymmetry today because nothing builds a dict from it, but tolerating a
         # duplicate here is how that asymmetry arrives later without anyone
         # noticing. Enumerating the class is the point, not patching the
@@ -246,18 +284,18 @@ def verify_run(run_dir: Path) -> tuple[list[tuple[bool, str]], list[str]]:
         _check(
             results,
             len(source_slugs) == len(set(source_slugs)),
-            "no data/manifest.json slug appears twice",
+            f"no {sources_label} slug appears twice",
         )
         listed = set(source_slugs)
         for row in manifest["documents"]:
             _check(
                 results,
                 row["slug"] in listed,
-                f"{row['slug']}: the scored document appears in data/manifest.json",
+                f"{row['slug']}: the scored document appears in {sources_label}",
             )
         skipped = []
         # Join the two halves of the provenance chain. Without this, one check
-        # says the fetched PDF matches data/manifest.json and another says the
+        # says the fetched PDF matches the sources manifest and another says the
         # run scored a document with some digest, and nothing says those are the
         # same file -- so a reader could verify a download that was never the
         # thing this run read.
@@ -274,7 +312,7 @@ def verify_run(run_dir: Path) -> tuple[list[tuple[bool, str]], list[str]]:
             # skipped, and the run would still report success.
             #
             # And `file_name` is untrusted for the same reason the payload and
-            # scored-Markdown paths are, with one aggravation: data/manifest.json
+            # scored-Markdown paths are, with one aggravation: the sources manifest
             # sits OUTSIDE the run bundle, so no recorded digest covers it. Edit
             # the name, the digest and the size together and the source check
             # passes against a file that was never fetched. Third member of this
@@ -305,7 +343,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Verify a recorded run without calling the API")
     parser.add_argument("run_dir", type=Path)
     args = parser.parse_args()
-    results, not_checked = verify_run(args.run_dir)
+    try:
+        results, not_checked = verify_run(args.run_dir)
+    except VerificationError as error:
+        # Exits nonzero with the reason, rather than a traceback that reads
+        # like a bug in the verifier instead of a problem with the bundle.
+        console.print(f"[red]FAILED[/] {error}")
+        sys.exit(1)
     failures = [message for ok, message in results if not ok]
     for ok, message in results:
         console.print(f"[green]  ok  [/] {message}" if ok else f"[red]FAILED[/] {message}")
