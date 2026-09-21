@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Answer questions about a passage with SIE Cloud and quote the sentence used.
+"""Turn internal incident reports into public status updates with SIE Cloud.
 
-    uv run python run.py                          # every pinned question
-    uv run python run.py --case oxygen            # one passage, both questions
-    python3 run.py --show oxygen__answerable      # print a request, no network
+    uv run python run.py                      # every pinned case
+    uv run python run.py --case sessionstore  # one case
+    python3 run.py --show sessionstore        # print a request, no network
 
-One call per question, the call the /chat task page shows:
+One call per case, the call the /chat task page shows:
 
     POST https://api.superlinked.com/v1/chat/completions
     {"model": "Qwen/Qwen3.8-27B-FP8",
-     "messages": [<instruction>, <passage and question>],
+     "messages": [<instruction>, <report>],
      "max_completion_tokens": 256}
 
 No sampling fields are sent, so the answer is whatever the model profile
@@ -38,8 +38,8 @@ import prompt
 HERE = Path(__file__).resolve().parent
 
 
-def record(client: Any, case: dict[str, Any], question: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
-    """Send one question and return its calls.json entry."""
+def record(client: Any, case: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """Send one case and return its calls.json entry."""
     requested_at = datetime.now(UTC).isoformat(timespec="seconds")
     started = time.monotonic()
     response = client.chat_completions(
@@ -51,20 +51,17 @@ def record(client: Any, case: dict[str, Any], question: dict[str, Any], body: di
     # The SDK attaches request-scoped metadata to the dict it returns. Drop it,
     # so `response` stays the server's own envelope and nothing else.
     envelope = {key: value for key, value in response.items() if key != "request"}
-    # Stop at the question that broke rather than at the end. score.py rejects
-    # an answerless entry or a missing revision later, but by then the
-    # remaining calls have already been paid for.
+    # Stop at the case that broke rather than at the end. score.py rejects an
+    # answerless entry or a missing revision later, but by then the remaining
+    # calls have already been paid for.
     choices = envelope.get("choices") or []
     content = choices[0].get("message", {}).get("content") if choices and isinstance(choices[0], dict) else None
     if not isinstance(content, str) or not content.strip():
-        raise SystemExit(f"{prompt.question_slug(case, question)}: the response carried no answer text")
+        raise SystemExit(f"{case['slug']}: the response carried no answer text")
     if not client.last_model_revision:
-        raise SystemExit(f"{prompt.question_slug(case, question)}: no served model revision reported")
+        raise SystemExit(f"{case['slug']}: the response reported no served model revision")
     return {
-        "slug": prompt.question_slug(case, question),
-        "case": case["slug"],
-        "qid": question["qid"],
-        "kind": question["kind"],
+        "slug": case["slug"],
         "requested_at": requested_at,
         "request": {
             "method": "POST",
@@ -82,8 +79,8 @@ def record(client: Any, case: dict[str, Any], question: dict[str, Any], body: di
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Record grounded answers from pinned passages")
-    parser.add_argument("--case", action="append", default=[], help="passage slug to run; repeatable, default all")
+    parser = argparse.ArgumentParser(description="Record status updates from pinned incident reports")
+    parser.add_argument("--case", action="append", default=[], help="slug to run; repeatable, default all")
     parser.add_argument("--show", metavar="SLUG", help="print one request body and exit, without calling anything")
     parser.add_argument(
         "--output", type=Path, default=HERE / "run-output", help="directory for manifest.json and calls.json"
@@ -97,18 +94,17 @@ def main() -> int:
     args = parse_args()
     cases_doc = prompt.load_cases()
     cases = {case["slug"]: case for case in cases_doc["cases"]}
-    pairs = [(case, question) for case in cases_doc["cases"] for question in case["questions"]]
-    by_slug = {prompt.question_slug(case, question): (case, question) for case, question in pairs}
 
     if args.show:
-        pair = by_slug.get(args.show)
-        if pair is None:
-            raise SystemExit(f"Unknown question: {args.show}. Known: {', '.join(sorted(by_slug))}")
-        print(json.dumps(prompt.request_body(cases_doc, *pair), indent=2, ensure_ascii=False))
+        case = cases.get(args.show)
+        if case is None:
+            raise SystemExit(f"Unknown case: {args.show}. Known: {', '.join(cases)}")
+        body = prompt.request_body(cases_doc, prompt.wikitext(case), case)
+        print(json.dumps(body, indent=2, ensure_ascii=False))
         return 0
 
-    # Imported only on the path that calls the API, so `--show` and every
-    # offline path run on a bare python3 with nothing installed.
+    # Imported only on the path that calls the API, so `--show` runs on a bare
+    # python3 with nothing installed.
     from sie_sdk import SIEClient
 
     selected = args.case or list(cases)
@@ -131,22 +127,21 @@ def main() -> int:
     entries = []
     for slug in selected:
         case = cases[slug]
-        for question in case["questions"]:
-            entry = record(client, case, question, prompt.request_body(cases_doc, case, question))
-            entries.append(entry)
-            revision = entry["model_revision"] or "not reported"
-            print(f"{entry['slug']:<40} {entry['timing']['duration_ms']:>8.0f} ms  revision {revision}")
+        entry = record(client, case, prompt.request_body(cases_doc, prompt.wikitext(case), case))
+        entries.append(entry)
+        revision = entry["model_revision"] or "not reported"
+        print(f"{slug:<32} {entry['timing']['duration_ms']:>8.0f} ms  revision {revision}")
 
     revisions = sorted({entry["model_revision"] for entry in entries if entry["model_revision"]})
     manifest = {
         "task": "chat",
-        "page": "https://superlinked.com/chat",
+        "page": "https://superlinked.com/sre",
         "endpoint": base_url,
         "path": prompt.CHAT_COMPLETIONS_PATH,
         "model": cases_doc["model"],
         "model_revision": revisions[0] if len(revisions) == 1 else revisions,
         "run_date": datetime.now(UTC).date().isoformat(),
-        "recorded_by": "examples/chat/run.py",
+        "recorded_by": "examples/incident-status-updates/run.py",
         "sampling": "model profile defaults; no temperature, top_p or seed was sent",
         "calls_recorded": len(entries),
         "response_sha256": (
