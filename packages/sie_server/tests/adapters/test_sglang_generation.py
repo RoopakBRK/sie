@@ -40,6 +40,7 @@ from sie_server.adapters.sglang.generation import (
     SGLangGenerationAdapter,
     _chunk_from_sglang_event,
     _encode_image_data,
+    _encode_video_data,
     _mamba_strategy_value,
     _p_unsafe_from_verdict_logprobs,
     _parse_sglang_generate_response,
@@ -618,6 +619,37 @@ def test_generate_forwards_image_data(mock_async_client: MagicMock, adapter) -> 
     assert body["image_data"][0].startswith("data:image/jpeg;base64,")
     # image_data is a TOP-LEVEL /generate field, not a sampling param.
     assert "image_data" not in body["sampling_params"]
+
+
+def test_encode_video_data_builds_data_uris_and_clamps_format() -> None:
+    out = _encode_video_data([{"data": b"\x00\x00\x00\x18ftypisom", "format": "mp4"}])
+    assert out is not None
+    assert out[0].startswith("data:video/mp4;base64,")
+    assert base64.b64decode(out[0].split(",", 1)[1]) == b"\x00\x00\x00\x18ftypisom"
+    clamped = _encode_video_data([{"data": b"x", "format": "x-mpegurl"}])
+    assert clamped is not None
+    assert clamped[0].startswith("data:video/mp4;base64,")
+    assert _encode_video_data(None) is None
+    assert _encode_video_data([]) is None
+    with pytest.raises(InvalidMediaError):
+        _encode_video_data([{"data": "not-bytes", "format": "mp4"}])
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_forwards_video_data(mock_async_client: MagicMock, adapter) -> None:
+    sse_lines = [
+        'data: {"text": "red", "meta_info": {"prompt_tokens": 5, "completion_tokens": 1, "finish_reason": {"type": "stop"}}}',
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    adapter._server_url = "http://localhost:30005"
+
+    videos = [{"data": b"\x00\x00\x00\x18ftypisom", "format": "mp4"}]
+    asyncio.run(collect_generation(adapter.generate(prompt="<video>what happens", max_new_tokens=8, videos=videos)))
+
+    body = client_instance_stream_body(mock_async_client)
+    assert body["video_data"][0].startswith("data:video/mp4;base64,")
+    assert "video_data" not in body["sampling_params"]
+    assert "image_data" not in body
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
@@ -2489,7 +2521,7 @@ secret = "data:video/mp4;base64,PRIVATEPAYLOADPRIVATEPAYLOAD"
 assert BaseMultimodalProcessor._load_single_item("ok", Modality.VIDEO) == "loaded"
 try:
     BaseMultimodalProcessor._load_single_item(secret, Modality.VIDEO, None, None, True)
-except RuntimeError as exc:
+except ValueError as exc:
     rendered = "".join(traceback.format_exception(exc))
     assert "PRIVATEPAYLOAD" not in rendered, rendered
     assert str(exc) == "Error while loading VIDEO data (ValueError)", str(exc)
@@ -2932,6 +2964,49 @@ async def test_http_type_refusal_requires_status_backend_and_grammar(status, bac
     )
     with pytest.raises(httpx.HTTPStatusError):
         await _raise_for_sglang_http_error(response, grammar=grammar, grammar_backend=backend)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("modality", "param"), [("VIDEO", "videos"), ("IMAGE", "images")])
+async def test_http_media_load_failure_is_invalid_request(modality: str, param: str) -> None:
+    response = httpx.Response(
+        400,
+        json={"error": {"message": f"Error while loading {modality} data (ValueError)"}},
+        request=httpx.Request("POST", "http://localhost/generate"),
+    )
+    with pytest.raises(GenerationInvalidRequestError) as error:
+        await _raise_for_sglang_http_error(response, grammar=None, grammar_backend=None)
+    assert error.value.param == param
+
+
+@pytest.mark.parametrize(("modality", "param"), [("VIDEO", "videos"), ("IMAGE", "images")])
+def test_stream_media_load_failure_is_invalid_request(modality: str, param: str) -> None:
+    event = {"error": {"message": f"Error while loading {modality} data (RuntimeError)"}}
+    with pytest.raises(GenerationInvalidRequestError) as error:
+        _raise_for_sglang_event_error(event)
+    assert error.value.param == param
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (400, "Error while loading data data:video/mp4;base64,AAAA: boom"),
+        (400, "Error while loading VIDEO data (ValueError) extra"),
+        (400, "Error while loading AUDIO data (ValueError)"),
+        (500, "Error while loading VIDEO data (ValueError)"),
+    ],
+)
+async def test_media_load_mapping_requires_the_exact_hook_message(status: int, message: str) -> None:
+    response = httpx.Response(
+        status, json={"error": {"message": message}}, request=httpx.Request("POST", "http://localhost/generate")
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await _raise_for_sglang_http_error(response, grammar=None, grammar_backend=None)
+    if status == 400:
+        with pytest.raises(GenerationError) as error:
+            _raise_for_sglang_event_error({"error": {"message": message}})
+        assert not isinstance(error.value, GenerationInvalidRequestError)
 
 
 @pytest.mark.asyncio
