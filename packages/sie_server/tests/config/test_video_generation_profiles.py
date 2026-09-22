@@ -23,9 +23,22 @@ def _video_budget_violations(config: ModelConfig) -> list[str]:
     violations: list[str] = []
     for name in config.profiles:
         args = [str(arg) for arg in config.resolve_profile(name).loadtime.get("extra_launch_args") or []]
-        video: dict[str, Any] = {}
-        if "--mm-process-config" in args:
-            video = json.loads(args[args.index("--mm-process-config") + 1]).get("video") or {}
+        video: dict[str, Any] | None = {}
+        flag = args.index("--mm-process-config") if "--mm-process-config" in args else -1
+        if flag >= 0:
+            value = args[flag + 1] if flag + 1 < len(args) else ""
+            if not value or value.startswith("--"):
+                violations.append(f"{config.sie_id}:{name} --mm-process-config has no value")
+                continue
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                violations.append(f"{config.sie_id}:{name} --mm-process-config is not JSON")
+                continue
+            video = decoded.get("video") or {} if isinstance(decoded, dict) else None
+            if not isinstance(video, dict):
+                violations.append(f"{config.sie_id}:{name} --mm-process-config is not an object")
+                continue
         total_pixels = video.get("total_pixels")
         max_frames = video.get("max_frames")
         min_pixels = video.get("min_pixels", DEFAULT_VIDEO_MIN_PIXELS)
@@ -48,8 +61,10 @@ def test_video_generation_profiles_bound_visual_tokens() -> None:
     )
 
 
-def _synthetic(video_block: dict[str, Any] | None) -> ModelConfig:
+def _synthetic(video_block: dict[str, Any] | None, *, trailing: list[str] | None = None) -> ModelConfig:
     args = ["--mm-process-config", json.dumps({"video": video_block})] if video_block is not None else []
+    if trailing is not None:
+        args = ["--mm-process-config", *trailing]
     return ModelConfig.model_validate(
         {
             "sie_id": "org/video-model",
@@ -81,3 +96,18 @@ def _synthetic(video_block: dict[str, Any] | None) -> ModelConfig:
 )
 def test_video_budget_check_detects_unbounded_profiles(video_block: dict[str, Any] | None, violates: bool) -> None:
     assert bool(_video_budget_violations(_synthetic(video_block))) is violates
+
+
+@pytest.mark.parametrize(
+    ("trailing", "expected"),
+    [
+        ([], "--mm-process-config has no value"),
+        (["--kv-cache-dtype", "bfloat16"], "--mm-process-config has no value"),
+        (["not json"], "--mm-process-config is not JSON"),
+        (["null"], "--mm-process-config is not an object"),
+        (['["video"]'], "--mm-process-config is not an object"),
+        (['{"video": 5}'], "--mm-process-config is not an object"),
+    ],
+)
+def test_video_budget_check_reports_a_flag_without_a_usable_value(trailing: list[str], expected: str) -> None:
+    assert _video_budget_violations(_synthetic(None, trailing=trailing)) == [f"org/video-model:default {expected}"]
