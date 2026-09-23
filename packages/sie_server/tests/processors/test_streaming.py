@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import threading
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -29,6 +30,7 @@ from sie_server.adapters._generation_base import (
     GenerationChunk,
     GenerationError,
     GenerationInputTooLongError,
+    GenerationInvalidRequestError,
     GenerationUnsupportedFieldError,
 )
 from sie_server.adapters._spec import AdapterSpec
@@ -38,7 +40,7 @@ from sie_server.config.model import ModelConfig
 from sie_server.observability import worker_telemetry as worker_metrics
 from sie_server.processors import streaming as streaming_mod
 from sie_server.processors.streaming import StreamingProcessor, _ValidationError
-from sie_server.types.grammar import GrammarSpec
+from sie_server.types.grammar import OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, GrammarSpec, GrammarValidationError
 
 _GEMMA_OPEN = "<" + "|channel" + ">" + "thought\n"
 _GEMMA_CLOSE = "<" + "channel|" + ">"
@@ -1120,8 +1122,11 @@ async def test_streaming_processor_hides_reasoning_for_every_resolved_profile(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enable_thinking", [False, True])
-async def test_streaming_processor_renders_chat_template(monkeypatch, enable_thinking: bool) -> None:
+@pytest.mark.parametrize(
+    "template_kwargs",
+    [{"enable_thinking": False}, {"enable_thinking": True}, {"guardian_config": {"risk_name": "harm"}}],
+)
+async def test_streaming_processor_renders_chat_template(monkeypatch, template_kwargs: dict[str, Any]) -> None:
     """``Messages`` shape → adapter receives the rendered template string."""
     nc = AsyncMock()
     script = [
@@ -1144,7 +1149,7 @@ async def test_streaming_processor_renders_chat_template(monkeypatch, enable_thi
 
     registry = _make_registry_with_chat_config(
         adapter,
-        chat_template_kwargs={"enable_thinking": enable_thinking},
+        chat_template_kwargs=template_kwargs,
     )
 
     # Patch ``load_tokenizer`` (called from a thread) with a stub that
@@ -1172,7 +1177,7 @@ async def test_streaming_processor_renders_chat_template(monkeypatch, enable_thi
 
     assert len(captured_prompts) == 1
     assert captured_prompts[0] == "<rendered>ping</rendered>"
-    assert seen_kwargs == {"enable_thinking": enable_thinking}
+    assert seen_kwargs == template_kwargs
     decoded = _decode_chunks(nc)
     visible = "".join(chunk.get("text_delta", "") for chunk in decoded)
     assert visible == "hi"
@@ -2803,6 +2808,55 @@ async def test_streaming_tool_choice_required_forwards_forcing_grammar() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parser", "call"),
+    [
+        ("glm47", "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>"),
+        ("qwen25", '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Tokyo"}}\n</tool_call>'),
+    ],
+)
+async def test_streaming_tool_call_is_forced_and_parsed_in_the_configured_format(parser: str, call: str) -> None:
+    nc = AsyncMock()
+    adapter = _FakeGenAdapter(
+        [
+            GenerationChunk(text_delta=call, is_first=True),
+            GenerationChunk(text_delta="", done=True, finish_reason="stop", prompt_tokens=5, completion_tokens=9),
+        ]
+    )
+    adapter._grammar_backend = "xgrammar"  # type: ignore[attr-defined]
+    captured: dict[str, Any] = {}
+    original = adapter.generate
+
+    async def _capture(prompt, *, max_new_tokens, temperature=1.0, top_p=1.0, stop=None, **kwargs):
+        captured.update(kwargs)
+        async for chunk in original(
+            prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, stop=stop
+        ):
+            yield chunk
+
+    adapter.generate = _capture  # type: ignore[method-assign]
+    registry = _make_registry(adapter)
+    resolved = MagicMock()
+    resolved.loadtime = {"tool_call_parser": parser}
+    registry.get_config.return_value.resolve_profile.return_value = resolved
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    wi = _make_work_item(
+        generate={"prompt": "weather?", "max_new_tokens": 64, "tools": _WEATHER_TOOLS, "tool_choice": "required"}
+    )
+
+    await proc.process(_make_msg(wi), "test/model")
+
+    grammar = captured.get("grammar")
+    assert grammar is not None
+    assert re.fullmatch(grammar.value, call)
+    decoded = _decode_chunks(nc)
+    tcs = _tool_call_deltas(decoded)
+    assert tcs[0]["function"]["name"] == "get_weather"
+    assert tcs[1]["function"]["arguments"] == '{"city":"Tokyo"}'
+    assert decoded[-1]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
 async def test_streaming_tool_choice_none_hides_tools_from_chat_template(monkeypatch) -> None:
     """``tool_choice='none'`` must prevent the model from ever seeing the
     tool catalogue.
@@ -3951,3 +4005,440 @@ async def test_streaming_processor_reserves_capped_visual_tokens(monkeypatch) ->
     assert terminal["error"]["code"] == "context_exceeded"
     assert "~image_tokens (1280)" in terminal["error"]["message"]
     msg.ack.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_count", [0, 1, 2])
+@pytest.mark.parametrize("finish_reason", ["stop", "error", "cancelled"])
+async def test_terminal_image_usage_counts_executed_images_only(
+    monkeypatch: pytest.MonkeyPatch, image_count: int, finish_reason: str
+) -> None:
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = "rendered prompt"
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", AsyncMock(return_value=tokenizer))
+    adapter = _FakeGenAdapter(
+        [
+            GenerationChunk(text_delta="ok", is_first=True),
+            GenerationChunk(
+                text_delta="",
+                done=True,
+                finish_reason=finish_reason,
+                prompt_tokens=5,
+                completion_tokens=2,
+            ),
+        ]
+    )
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=_make_registry(adapter), worker_id="w1")
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "describe",
+                    "images": [{"data": b"image", "format": "png"}] * image_count,
+                }
+            ],
+            "max_new_tokens": 8,
+        }
+    )
+    await proc.process(_make_msg(wi), "test/model")
+    chunks = [msgpack.unpackb(call.args[1], raw=False) for call in nc.publish.call_args_list]
+    terminal = next(chunk for chunk in chunks if chunk.get("done"))
+    usage = terminal["usage"]
+    assert usage["prompt_tokens"] == 5
+    assert usage["completion_tokens"] == 2
+    if image_count and finish_reason == "stop":
+        assert usage["images"] == image_count
+    else:
+        assert "images" not in usage
+    assert all("images" not in chunk.get("usage", {}) for chunk in chunks if not chunk.get("done"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("emit_terminal", [False, True])
+async def test_image_generation_without_token_counts_does_not_synthesize_usage(
+    monkeypatch: pytest.MonkeyPatch, emit_terminal: bool
+) -> None:
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = "rendered prompt"
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", AsyncMock(return_value=tokenizer))
+    script = [GenerationChunk(text_delta="ok", is_first=True)]
+    if emit_terminal:
+        script.append(GenerationChunk(text_delta="", done=True, finish_reason="stop"))
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=_make_registry(_FakeGenAdapter(script)), worker_id="w1")
+    wi = _make_work_item(
+        generate={
+            "messages": [{"role": "user", "content": "describe", "images": [{"data": b"image", "format": "png"}]}],
+            "max_new_tokens": 8,
+        }
+    )
+
+    await proc.process(_make_msg(wi), "test/model")
+
+    terminal = _terminal_chunk(nc)
+    assert terminal["done"] is True
+    assert "usage" not in terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tools", [None, [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]]
+)
+async def test_hidden_reasoning_emits_progress_before_visible_answer(
+    monkeypatch: pytest.MonkeyPatch, tools: Any
+) -> None:
+    nc = AsyncMock()
+    script = [
+        GenerationChunk(text_delta="<think>private", is_first=True, logprobs=({"token": "private"},)),
+        GenerationChunk(text_delta=" still private"),
+        GenerationChunk(text_delta="</think>Answer"),
+        GenerationChunk(text_delta="", done=True, finish_reason="stop", prompt_tokens=2, completion_tokens=8),
+    ]
+    adapter = _FakeGenAdapter(script)
+    registry = _make_registry_with_chat_config(adapter, chat_template_kwargs={"enable_thinking": False})
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    monkeypatch.setattr(proc, "_check_context_length", AsyncMock(return_value=None))
+    monkeypatch.setattr("sie_server.processors.streaming._FLUSH_INTERVAL_S", 0)
+    work = _make_work_item()
+    if tools is not None:
+        work["generate"]["tools"] = tools
+    await proc.process(_make_msg(work), "test/model")
+    decoded = _decode_chunks(nc)
+    assert [chunk["seq"] for chunk in decoded] == list(range(len(decoded)))
+    assert decoded[0]["text_delta"] == ""
+    assert decoded[0]["done"] is False
+    assert not decoded[0].get("is_first")
+    assert decoded[1]["text_delta"] == ""
+    assert "private" not in str(decoded)
+    visible = next(chunk for chunk in decoded if chunk["text_delta"])
+    assert visible["text_delta"] == "Answer"
+    assert visible["is_first"] is True
+    assert decoded[-1]["done"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template_kwargs", [{"enable_thinking": False}, {"guardian_config": {"risk_name": "harm"}}])
+async def test_native_raw_prompt_is_preserved_with_served_template_settings(
+    monkeypatch: pytest.MonkeyPatch, template_kwargs: dict[str, Any]
+) -> None:
+    nc = AsyncMock()
+    adapter = _PreflightGenAdapter()
+    registry = _make_registry_with_chat_config(adapter, chat_template_kwargs=template_kwargs)
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    monkeypatch.setattr(proc, "_check_context_length", AsyncMock(return_value=None))
+    render = AsyncMock()
+    monkeypatch.setattr(proc, "_render_chat_template", render)
+    prompt = "Already rendered prefix\n<assistant>"
+    await proc.process(_make_msg(_make_work_item(generate={"prompt": prompt, "max_new_tokens": 16})), "test/model")
+    assert adapter.dispatched_parameters is not None
+    assert adapter.dispatched_parameters["prompt"] == prompt
+    render.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_known_type_refusal_is_identical_for_preflight_leader_and_follower(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    following = asyncio.Event()
+    release = threading.Event()
+    real_wait_for = streaming_mod._wait_for
+
+    def reject(_tok, _grammar):
+        loop.call_soon_threadsafe(started.set)
+        if not release.wait(timeout=5):
+            raise AssertionError("compile was not released")
+        raise GrammarValidationError(OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, code="invalid_request", param="grammar")
+
+    calls = _patch_compile(monkeypatch, reject)
+    registry = _make_registry(_FakeGenAdapter([]))
+    registry.get_config.side_effect = KeyError("no config")
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    grammar = GrammarSpec(kind="json_schema", value={"type": ["string", "null"]})
+    messages = [_make_msg(_make_work_item()) for _ in range(2)]
+
+    def wait_for(awaitable, *, timeout):
+        if timeout == streaming_mod._GRAMMAR_FOLLOWER_TIMEOUT_S:
+            following.set()
+        return real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(streaming_mod, "_wait_for", wait_for)
+
+    async def run(index):
+        return await proc._ensure_grammar_ready(
+            grammar,
+            model_id="test/model",
+            reply_subject="_INBOX.test",
+            request_id=f"req-{index}",
+            attempt_id=f"att-{index}",
+            msg=messages[index],
+        )
+
+    leader = asyncio.create_task(run(0))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        follower = asyncio.create_task(run(1))
+        await asyncio.wait_for(following.wait(), timeout=3)
+    finally:
+        release.set()
+    assert await asyncio.gather(leader, follower) == [False, False]
+    assert len(calls) == 1
+    terminals = [msgpack.unpackb(call.args[1], raw=False) for call in nc.publish.call_args_list]
+    assert len(terminals) == 2
+    for index, terminal in enumerate(terminals):
+        assert terminal["error"] == {
+            "code": "invalid_request",
+            "message": OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+            "param": "grammar",
+        }
+        assert terminal["request_id"] == f"req-{index}"
+        assert terminal["attempt_id"] == f"att-{index}"
+        assert terminal["finish_reason"] == "error"
+        assert terminal.get("usage") is None
+        messages[index].ack.assert_awaited_once()
+        messages[index].nak.assert_not_awaited()
+    assert proc._grammar_inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_backend_type_refusal_survives_worker_terminal_and_settlement(monkeypatch) -> None:
+    nc = AsyncMock()
+    adapter = _PreflightGenAdapter(
+        GenerationInvalidRequestError("grammar", OUTLINES_JSON_SCHEMA_TYPE_MESSAGE), raise_during_generate=True
+    )
+    registry = _make_registry(adapter)
+    registry.get_config.return_value = _make_generation_config()
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    monkeypatch.setattr(proc, "_check_context_length", AsyncMock(return_value=None))
+    message = _make_msg(_make_work_item())
+    await proc.process(message, "test/model")
+    terminal = _decode_chunks(nc)[-1]
+    assert terminal["error"] == {
+        "code": "invalid_request",
+        "message": OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+        "param": "grammar",
+    }
+    assert terminal["finish_reason"] == "error"
+    assert terminal.get("usage") is None
+    message.ack.assert_awaited_once()
+    assert adapter.close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["cancel", "timeout"])
+@pytest.mark.parametrize("refusal", [False, True])
+async def test_grammar_follower_interruption_preserves_shared_compile(monkeypatch, interruption, refusal) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    following = asyncio.Event()
+    real_wait_for = streaming_mod._wait_for
+    nc = AsyncMock()
+    registry = _make_registry(_FakeGenAdapter([]))
+    registry.get_config.side_effect = KeyError("no config")
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    grammar = GrammarSpec(kind="json_schema", value={"type": ["string", "null"]})
+    messages = [_make_msg(_make_work_item()) for _ in range(3)]
+
+    async def tokenizer(_):
+        started.set()
+        await release.wait()
+        return object()
+
+    def compile_result(*_):
+        if refusal:
+            raise GrammarValidationError(OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, code="invalid_request", param="grammar")
+        return True
+
+    calls = _patch_compile(monkeypatch, compile_result)
+    monkeypatch.setattr(proc, "_get_tokenizer", tokenizer)
+
+    def wait_for(awaitable, *, timeout):
+        if timeout == streaming_mod._GRAMMAR_FOLLOWER_TIMEOUT_S:
+            following.set()
+            if interruption == "timeout" and asyncio.current_task() is interrupted:
+                timeout = 0
+        return real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(streaming_mod, "_wait_for", wait_for)
+
+    async def run(index):
+        return await proc._ensure_grammar_ready(
+            grammar,
+            model_id="test/model",
+            reply_subject="_INBOX.test",
+            request_id=f"req-{index}",
+            attempt_id=f"att-{index}",
+            msg=messages[index],
+        )
+
+    leader = asyncio.create_task(run(0))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        interrupted = asyncio.create_task(run(1))
+        await asyncio.wait_for(following.wait(), timeout=3)
+        following.clear()
+        remaining = asyncio.create_task(run(2))
+        await asyncio.wait_for(following.wait(), timeout=3)
+        if interruption == "cancel":
+            interrupted.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await interrupted
+            messages[1].ack.assert_not_awaited()
+            messages[1].nak.assert_not_awaited()
+            assert all(chunk["request_id"] != "req-1" for chunk in _decode_chunks(nc))
+        else:
+            assert await asyncio.wait_for(interrupted, timeout=3) is False
+            messages[1].ack.assert_awaited_once()
+            timed_out = [chunk for chunk in _decode_chunks(nc) if chunk["request_id"] == "req-1"]
+            assert len(timed_out) == 1
+            assert timed_out[0]["error"]["code"] == "grammar_compile_failed"
+            assert timed_out[0].get("usage") is None
+        shared = next(iter(proc._grammar_inflight.values()))
+        assert not shared.done()
+    finally:
+        release.set()
+    assert await asyncio.gather(leader, remaining) == [not refusal, not refusal]
+    assert len(calls) == 1
+    assert proc._grammar_inflight == {}
+    if refusal:
+        for message in (messages[0], messages[2]):
+            message.ack.assert_awaited_once()
+        terminals = _decode_chunks(nc)
+        kept = [chunk for chunk in terminals if chunk["request_id"] in {"req-0", "req-2"}]
+        assert len(kept) == 2
+        assert all(chunk["error"]["code"] == "invalid_request" and chunk.get("usage") is None for chunk in kept)
+
+
+def _mp4_bytes(tmp_path: Any, *, width: int = 64, height: int = 48, frames: int = 6) -> bytes:
+    import cv2
+    import numpy as np
+
+    path = tmp_path / "clip.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (width, height))
+    for index in range(frames):
+        writer.write(np.full((height, width, 3), index * 40, dtype=np.uint8))
+    writer.release()
+    return path.read_bytes()
+
+
+def _video_message(data: bytes, *, markers: int = 1) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": "what happens first?",
+        "videos": [{"data": base64.b64encode(data).decode(), "format": "mp4"}],
+        "content_parts": [{"type": "video"}] * markers + [{"type": "text", "text": "what happens first?"}],
+    }
+
+
+class _VideoRecordingAdapter(_FakeGenAdapter):
+    def __init__(self, script: list[GenerationChunk]) -> None:
+        super().__init__(script)
+        self.received_videos: Any = "UNSET"
+
+    async def generate(self, prompt: str, *, max_new_tokens: int, **kwargs: Any) -> AsyncIterator[GenerationChunk]:
+        self.received_videos = kwargs.get("videos")
+        for chunk in self._script:
+            yield chunk
+
+
+def _video_processor(monkeypatch: pytest.MonkeyPatch, *, video: bool) -> tuple[StreamingProcessor, Any, Any, list]:
+    rendered: list[Any] = []
+
+    async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
+        class _Tok:
+            def apply_chat_template(self, message_dicts: Any, **_kw: Any) -> str:
+                rendered.append(message_dicts)
+                return "rendered prompt"
+
+        return _Tok()
+
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+    adapter = _VideoRecordingAdapter(
+        [
+            GenerationChunk(text_delta="red", is_first=True),
+            GenerationChunk(text_delta="", done=True, finish_reason="stop", prompt_tokens=5, completion_tokens=1),
+        ]
+    )
+    registry = _make_registry(adapter)
+    registry.get_config.return_value.inputs.video = video
+    nc = AsyncMock()
+    return StreamingProcessor(nc=nc, registry=registry, worker_id="w1"), nc, adapter, rendered
+
+
+@pytest.mark.asyncio
+async def test_messages_video_field_reaches_adapter_with_marker(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    clip = _mp4_bytes(tmp_path)
+    proc, nc, adapter, rendered = _video_processor(monkeypatch, video=True)
+    wi = _make_work_item(generate={"messages": [_video_message(clip)], "max_new_tokens": 8})
+    await proc.process(_make_msg(wi), "test/model")
+    assert _decode_chunks(nc)[-1].get("error") is None
+    assert adapter.received_videos == [{"data": clip, "format": "mp4"}]
+    assert rendered[0][0]["content"][0] == {"type": "video"}
+
+
+@pytest.mark.asyncio
+async def test_video_rejected_on_model_without_video_input(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    proc, nc, adapter, _ = _video_processor(monkeypatch, video=False)
+    wi = _make_work_item(generate={"messages": [_video_message(_mp4_bytes(tmp_path))], "max_new_tokens": 8})
+    await proc.process(_make_msg(wi), "test/model")
+    terminal = _decode_chunks(nc)[-1]
+    assert terminal["error"]["code"] == "invalid_request"
+    assert "does not support video input" in terminal["error"]["message"]
+    assert adapter.received_videos == "UNSET"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["pixels", "duration", "frames", "fps", "undecodable"])
+async def test_video_over_decode_bounds_never_reaches_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, limit: str
+) -> None:
+    from sie_server.core import video_frames
+
+    clip = _mp4_bytes(tmp_path)
+    if limit == "pixels":
+        monkeypatch.setattr(video_frames, "MAX_GENERATION_VIDEO_FRAME_PIXELS", 64 * 47)
+    elif limit == "duration":
+        monkeypatch.setattr(video_frames, "MAX_VIDEO_DURATION_S", 0.1)
+    elif limit == "frames":
+        monkeypatch.setattr(video_frames, "MAX_GENERATION_VIDEO_FRAMES", 5)
+    elif limit == "fps":
+        monkeypatch.setattr(video_frames, "MAX_GENERATION_VIDEO_FPS", 5.0)
+    else:
+        clip = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 64
+    proc, nc, adapter, _ = _video_processor(monkeypatch, video=True)
+    wi = _make_work_item(generate={"messages": [_video_message(clip)], "max_new_tokens": 8})
+    await proc.process(_make_msg(wi), "test/model")
+    assert _decode_chunks(nc)[-1]["error"]["code"] == "invalid_request"
+    assert adapter.received_videos == "UNSET"
+
+
+def test_queued_video_over_sidecar_budget_is_rejected() -> None:
+    oversized = b"\x00\x00\x00\x18ftypisom" + b"\x00" * (16 * 1024 * 1024)
+    result = streaming_mod._parse_message_videos_field([{"data": oversized, "format": "mp4"}], 0)
+    assert isinstance(result, _ValidationError)
+    assert "video too large" in result.message
+
+
+@pytest.mark.parametrize(
+    ("messages", "fragment"),
+    [
+        ([_video_message(b"\x00\x00\x00\x18ftypisom", markers=0)], "0 video placeholder(s) but 1 video(s)"),
+        ([_video_message(b"\x00\x00\x00\x18ftypisom", markers=2)], "2 video placeholder(s) but 1 video(s)"),
+        (
+            [_video_message(b"\x00\x00\x00\x18ftypisom"), _video_message(b"\x00\x00\x00\x18ftypisom")],
+            "too many videos",
+        ),
+        (
+            [{**_video_message(b"#EXTM3U\n"), "content_parts": [{"type": "video"}]}],
+            "MP4/MOV, WebM/Matroska, or AVI",
+        ),
+        ([{**_video_message(b"x"), "videos": "nope"}], "videos must be an array"),
+    ],
+)
+def test_validate_rejects_malformed_video_messages(messages: list[dict[str, Any]], fragment: str) -> None:
+    proc = StreamingProcessor(nc=AsyncMock(), registry=_make_registry(_FakeGenAdapter([])), worker_id="w1")
+    result = proc._validate_generate_params({"generate": {"messages": messages, "max_new_tokens": 8}}, None)
+    assert isinstance(result, _ValidationError)
+    assert fragment in result.message

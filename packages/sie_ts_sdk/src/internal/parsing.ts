@@ -723,6 +723,7 @@ export function parseExtractResults(data: unknown[]): ExtractResult[] {
 }
 
 interface WireUsageBlock {
+  images?: unknown;
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
@@ -793,6 +794,12 @@ function coerceTokenCount(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : 0;
 }
 
+function isPositiveSafeInteger(value: unknown): value is number {
+  return (
+    typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff
+  );
+}
+
 export function parseGenerateResult(data: Record<string, unknown>): GenerateResult {
   const wire = data as WireGenerateResult;
   if (typeof wire.model !== "string") {
@@ -815,6 +822,7 @@ export function parseGenerateResult(data: Record<string, unknown>): GenerateResu
       promptTokens: coerceTokenCount(usage.prompt_tokens),
       completionTokens: coerceTokenCount(usage.completion_tokens),
       totalTokens: coerceTokenCount(usage.total_tokens),
+      ...(isPositiveSafeInteger(usage.images) ? { images: usage.images } : {}),
       // #2434: the gateway merges the settled charge into this same block, so
       // rebuilding it field-by-field must carry the charge across. Absence
       // stays absence — a request that committed no debit gets neither key.

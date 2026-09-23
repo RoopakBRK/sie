@@ -278,6 +278,23 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
         }
     });
 
+    if let Some(chunk) = value
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(|schemas| schemas.get_mut("GenerateChunk"))
+    {
+        chunk["oneOf"] = json!([
+            {
+                "required": ["execution_identity_sha256", "execution_binding_sha256"],
+                "properties": {"done": {"const": true}, "error": {"type": "null"}}
+            },
+            {"not": {"anyOf": [
+                {"required": ["execution_identity_sha256"]},
+                {"required": ["execution_binding_sha256"]}
+            ]}}
+        ]);
+    }
+
     if let Some(create_pool) = value
         .get_mut("components")
         .and_then(|components| components.get_mut("schemas"))
@@ -827,7 +844,9 @@ fn patch_chat_message_schema(value: &mut Value) {
                             (`image_url` / `input_image`) carrying a base64 `data:` URI are \
                             accepted for generation models that declare `inputs.image`; non-vision models \
                             reject with 400 unsupported_field and remote (non-`data:`) URLs \
-                            reject with 400 invalid_request. May be \
+                            reject with 400 invalid_request. One `video_url` part per request \
+                            (`{url: \"data:video/<subtype>;base64,...\"}`, MP4/MOV, WebM/Matroska \
+                            or AVI) is accepted for generation models that declare `inputs.video`. May be \
                             `null` on a `role:\"assistant\"` message that carries `tool_calls`.",
             "oneOf": [
                 {"type": "string"},
@@ -837,7 +856,7 @@ fn patch_chat_message_schema(value: &mut Value) {
                         "type": "object",
                         "required": ["type"],
                         "properties": {
-                            "type": {"type": "string", "enum": ["text", "input_text", "image_url", "input_image"]},
+                            "type": {"type": "string", "enum": ["text", "input_text", "image_url", "input_image", "video_url"]},
                             "text": {"type": "string"},
                             "image_url": {
                                 "description": "Image payload for `image_url` / `input_image` parts: a base64 `data:` URI, either as a bare string or as `{ \"url\": \"data:...\" }`. Remote (non-`data:`) URLs reject with 400 invalid_request.",
@@ -845,6 +864,13 @@ fn patch_chat_message_schema(value: &mut Value) {
                                     {"type": "string"},
                                     {"type": "object", "properties": {"url": {"type": "string"}}},
                                 ],
+                            },
+                            "video_url": {
+                                "description": "Video payload for `video_url` parts: `{ \"url\": \"data:video/<subtype>;base64,...\" }` with no other keys. The container is identified from its bytes (MP4/MOV, WebM/Matroska, AVI). Remote URLs reject with 400 invalid_request.",
+                                "type": "object",
+                                "required": ["url"],
+                                "additionalProperties": false,
+                                "properties": {"url": {"type": "string"}},
                             },
                         },
                     },
@@ -1358,14 +1384,14 @@ fn inject_inference_response_headers(paths: &mut serde_json::Map<String, Value>)
     let queue_success_headers = json!({
         "X-SIE-Version": header("Gateway package version that handled the request"),
         "X-SIE-Server-Version": header("Gateway-compatible server version advertised by this gateway"),
-        "X-SIE-Model-Revision": header(
-            "Immutable deployed bundle/config execution revision that handled the request, when available",
+        "X-SIE-Model-Revision": sha256_header(
+            "Executed bundle/config SHA-256, distinct from the catalog weights revision (for example, a 40-hex Hugging Face commit). Buffered responses only: present when the routing snapshot has a model revision and all successful worker results report its expected config hash. Omitted when evidence is unavailable or mismatched, and always omitted on SSE because headers precede terminal execution evidence.",
         ),
         "X-SIE-Execution-Identity-SHA256": sha256_header(
-            "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available",
+            "Worker-origin SHA-256 identity of the immutable release and realized serving resources, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
         ),
         "X-SIE-Execution-Binding-SHA256": sha256_header(
-            "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available",
+            "Worker-origin runtime-independent SHA-256 binding of the release and deployment route, when available on buffered responses. SSE carries optional execution evidence in the successful terminal event instead of headers.",
         ),
         "X-SIE-Request-Id": header("Gateway request id for queue-backed inference"),
         "X-SIE-Worker": header("Logical queue worker tag that produced the response"),
@@ -1979,6 +2005,10 @@ pub struct GenerateUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Number of input images observed by the worker after successful execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1)]
+    pub images: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2029,6 +2059,18 @@ pub struct GenerateChunk {
     pub logprobs: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<GenerateChunkError>,
+    /// Worker-origin execution identity, only on a successful terminal event.
+    /// Optional complete pair with execution_binding_sha256; older or
+    /// self-hosted deployments may omit both. Not a catalog weights revision
+    /// or the executed bundle/config hash.
+    #[schema(pattern = "^[0-9a-f]{64}$", nullable = false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_identity_sha256: Option<String>,
+    /// Worker-origin execution binding, only on a successful terminal event
+    /// together with execution_identity_sha256. Both are lowercase SHA-256 digests.
+    #[schema(pattern = "^[0-9a-f]{64}$", nullable = false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding_sha256: Option<String>,
 }
 
 // ── /v1/chat/completions schemas ──────────────────────────────────
@@ -2288,6 +2330,10 @@ pub struct ChatCompletionUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Number of input images observed by the worker after successful execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1)]
+    pub images: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3507,6 +3553,32 @@ mod tests {
             chunk["properties"]["error"]["oneOf"][1]["$ref"],
             "#/components/schemas/GenerateChunkError"
         );
+        for field in ["execution_identity_sha256", "execution_binding_sha256"] {
+            assert_eq!(chunk["properties"][field]["pattern"], "^[0-9a-f]{64}$");
+            assert!(!chunk["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field)));
+        }
+        assert_eq!(
+            chunk["oneOf"],
+            json!([
+                {
+                    "required": ["execution_identity_sha256", "execution_binding_sha256"],
+                    "properties": {"done": {"const": true}, "error": {"type": "null"}}
+                },
+                {"not": {"anyOf": [
+                    {"required": ["execution_identity_sha256"]},
+                    {"required": ["execution_binding_sha256"]}
+                ]}}
+            ])
+        );
+        let revision = &spec["paths"]["/v1/generate/{model}"]["post"]["responses"]["200"]
+            ["headers"]["X-SIE-Model-Revision"];
+        assert_eq!(revision["schema"]["pattern"], "^[0-9a-f]{64}$");
+        let description = revision["description"].as_str().unwrap();
+        assert!(description.contains("catalog weights revision"));
+        assert!(description.contains("always omitted on SSE"));
         let chunk_error = &spec["components"]["schemas"]["GenerateChunkError"];
         assert_eq!(
             chunk_error["properties"]["param"]["type"],

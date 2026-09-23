@@ -19,8 +19,9 @@ import httpx
 import pytest
 from sie_sdk import SIEAsyncClient, SIEClient, SIEConnectionError
 from sie_sdk.client._shared import MODAL_CONTINUATION_MAX_HOPS, validate_generate_grammar
-from sie_sdk.client.async_ import _AioResponse
+from sie_sdk.client.async_ import _AioResponse, _parse_generate_result_async
 from sie_sdk.client.errors import ModelLoadingError, ProvisioningError, RequestError, ServerError
+from sie_sdk.client.sync import _parse_generate_result
 
 
 def _ok_response(payload: dict, headers: dict[str, str] | None = None) -> MagicMock:
@@ -1239,3 +1240,42 @@ class TestParseGenerateResultStrictContract:
 
         with pytest.raises(RequestError):
             _parse_generate_result_async(envelope)
+
+
+@pytest.mark.parametrize("images", [None, 0, -1, True, "1", 1.5, 2**32])
+def test_generate_parsers_omit_invalid_image_usage(images: object) -> None:
+    for parse in (_parse_generate_result, _parse_generate_result_async):
+        result = parse({"model": "test/model", "text": "ok", "usage": {"images": images}})
+        assert "images" not in result["usage"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_buffered_generate_preserves_image_usage_and_binding(asynchronous: bool) -> None:
+    body = _ok_envelope()
+    body["usage"]["images"] = 1
+    headers = {
+        "content-type": "application/json",
+        "x-sie-execution-identity-sha256": "a" * 64,
+        "x-sie-execution-binding-sha256": "b" * 64,
+        "x-sie-units-images": "1",
+    }
+    if asynchronous:
+        source = AsyncMock(return_value=_aio_raw_resp(200, json.dumps(body).encode(), headers))
+        session = MagicMock()
+        session.post = _make_session_post(source)
+        session.close = AsyncMock()
+        with patch("sie_sdk.client.async_.aiohttp.ClientSession", return_value=session):
+            async with SIEAsyncClient("http://localhost:8080") as client:
+                result = await client.generate("m", prompt="describe", max_new_tokens=8)
+    else:
+        response = _ok_response(body)
+        response.headers = headers
+        with patch("sie_sdk.client.sync.httpx.Client") as transport:
+            transport.return_value.post.return_value = response
+            with SIEClient("http://localhost:8080") as client:
+                result = client.generate("m", prompt="describe", max_new_tokens=8)
+    assert result["usage"]["images"] == 1
+    assert result["request"]["usage"]["images"] == 1
+    assert result["request"]["execution_identity_sha256"] == "a" * 64
+    assert result["request"]["execution_binding_sha256"] == "b" * 64

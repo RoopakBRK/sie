@@ -20,10 +20,17 @@ commits generate `CHANGELOG.md`. No old changelog sections are rewritten.
 
 The release PR updates the coordinated Python/npm package versions, gateway,
 sidecar and audio release fields, TypeScript runtime version, and Helm metadata.
-It also refreshes the coupled public locks. Config and MCP join this train for
-their first PyPI publication. Independently versioned implementation crates are
-not silently renumbered: a Rust worker image follows the release image tag even
-where its crate has an independent version.
+It also refreshes the coupled public locks and stamps the new version into the
+committed server and gateway OpenAPI documents. CI regenerates those documents
+and requires identical bytes, so they are not release-please extra files: its
+JSON rewrite changes number formatting and precision, string escapes, and key
+order. Config and MCP join this train for their first PyPI publication.
+The refresh also formats the SDK package metadata rewritten by release-please
+with the lockfile-pinned Biome version and the SDK's formatter configuration.
+Only that manifest is formatted; its release version and metadata are preserved.
+Independently versioned implementation crates are not silently renumbered: a
+Rust worker image follows the release image tag even where its crate has an
+independent version.
 
 Release PRs receive the same mandatory CI checks as other PRs. Release-please
 and its lock refresh use a repository-scoped GitHub App so their PR updates
@@ -98,12 +105,38 @@ PR and candidate builds produce archives without publishing. They use the
 actual package versions in that source tree. Release builds additionally
 require the complete package set to match the release version.
 
+The `Release candidate` workflow rehearses all six artifact families without
+registry credentials or release-writing permissions. It runs on release
+pipeline changes and release version updates, and can be dispatched manually
+against a reviewed branch. It builds the full image matrix and extracts the
+native sidecar from its tested image, as well as building Python, npm, audio,
+and the packaged Helm chart. Require its final `Release candidate / Complete`
+check on the final release PR head before merging that PR.
+
+On a stable release, every builder must pass the `artifacts-ready` gate before
+any publisher can start. Publishers consume the retained archives. This keeps
+a failed image or chart build from leaving packages partially published.
+Registry failures can still interrupt publication; recovery resumes the
+original failed publisher with its same version, source and retained bytes.
+
 Build outputs are tested before upload. Publisher jobs consume those same
 archives or images; they do not independently rebuild them. Before a release
 upload, the run commit, release output commit, checked-out source, and stable
 tag must identify the same revision. Versioned outputs are immutable: an
 existing matching upload may be accepted, but different bytes at the same
 version are a failure.
+
+The Candle CUDA image is checked on driverless runners using its source-bound
+image configuration, extracted ELF executable, and image-local shared-library
+resolution. Only the host-provided `libcuda.so.1` may be unresolved; all other
+missing libraries and loader diagnostics fail validation. The same check runs
+in Rust CUDA image PR CI. These checks do not exercise GPU inference. CPU Rust
+and the other service images retain their executable `--help` smoke checks.
+
+Package Helm charts with `mise run helm -- package --destination DIR`. This
+stages the checked-in model and bundle catalogs, checks their exact bytes in
+the archive, and lints and renders that archive after staging is removed,
+including the embedded-config mode. CI and publication use this same path.
 
 Floating image aliases move only after the full versioned image set verifies.
 An older release recovery keeps those aliases unchanged when a newer stable
@@ -131,9 +164,16 @@ Finalize these identities before enabling uploads:
 
 PyPI/npm upload jobs live in the top-level workflow so the configured OIDC
 identity is unambiguous. Existing package names use their existing registry
-settings; only new PyPI projects need pending publishers. Register config and
-MCP when their first upload is ready. Audio assets do not need another PyPI
-registration.
+settings; only new PyPI projects need pending publishers. PyPI allows only one
+pending project per publisher identity, so bootstrap config and MCP sequentially
+with the same repository, `release.yml` workflow, and `pypi` environment. Register
+`sie-config` first. Its next OIDC token exchange creates the project and converts
+the pending publisher into an ordinary publisher. Then register `sie-mcp` and
+request another original-run publisher retry so a new token exchange creates it.
+One upload attempt mints its token only once; adding the second pending publisher
+does not extend a token already issued to the first attempt. Recovery verifies
+and skips byte-identical files already uploaded and consumes the same retained
+archives. Audio assets do not need another PyPI registration.
 
 npm supports one trusted publisher per package. Its actual upload job uses a
 GitHub-hosted runner and a pinned supported npm version. Ordinary builds and
@@ -177,6 +217,27 @@ registry credentials. Do not enable two competing publishers for the same
 artifact destination.
 
 ## Recovery
+
+### Release-PR authoring
+
+To refresh an open release PR, use the push-to-`main` authoring workflow. Merge
+any automation repair through normal review and CI, then approve that commit's
+`release-automation` job. The manual entrypoint below only recovers failed
+publication; it does not refresh release PRs.
+
+Before resuming a waiting authoring run, inspect its source revision and workflow:
+release-please can read current `main`, but the run still executes the workflow
+from its original push. An old run can therefore generate current release files
+using outdated refresh steps. Cancel obsolete queued **push** runs before
+cancelling the old waiting run, then retain the authoring run from the intended
+current source. Do not cancel publication or recovery runs as part of this
+cleanup. Keep the environment protections and approve the retained run normally.
+If the intended push run was cancelled, rerun that exact push run after checking
+its source and workflow, while GitHub still permits the rerun; do not replay the
+obsolete backlog. Verify the generated PR's source ancestry after refresh, too:
+the approved run's revision does not freeze release-please's reads of `main`.
+
+### Artifact publication
 
 Retain release build artifacts for at least 30 days. Normal recovery reruns
 failed publication jobs from the original release workflow run. This preserves

@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
+from tools.ci import cuda13_image_smoke
 from tools.ci.release_artifact import create_manifest
 from tools.mise_tasks import docker_task
 
@@ -20,7 +22,15 @@ MATRIX = docker_task.DEFAULT_MATRIX
 def complete_source(tmp_path: Path, monkeypatch):
     bundles = tmp_path / "packages/sie_server/bundles"
     bundles.mkdir(parents=True)
-    for name in ("default", "ctranslate2", "sglang", "transformers5", "sglang-cu130", "tensorrt-llm"):
+    for name in (
+        "default",
+        "ctranslate2",
+        "sglang",
+        "transformers5",
+        "sglang-vision-extract",
+        "sglang-cu130",
+        "tensorrt-llm",
+    ):
         platform = "cuda13" if name in {"sglang-cu130", "tensorrt-llm"} else "cuda12"
         (bundles / f"{name}.yaml").write_text(f"name: {name}\nplatform: {platform}\n")
     monkeypatch.setattr(docker_task, "ROOT", tmp_path)
@@ -44,13 +54,13 @@ def archive(tmp_path: Path, image: str = IMAGE):
     )
 
 
-def test_release_matrix_resolves_exact_ten_pairs(complete_source):
+def test_release_matrix_resolves_exact_eleven_pairs(complete_source):
     assert {(target.platform, target.bundle) for target in complete_source} == {
         (platform, bundle)
         for platform in ("cuda12", "cpu")
         for bundle in ("default", "ctranslate2", "sglang", "transformers5")
-    } | {("cuda13", "sglang-cu130"), ("cuda13", "tensorrt-llm")}
-    assert len(complete_source) == 10
+    } | {("cuda12", "sglang-vision-extract"), ("cuda13", "sglang-cu130"), ("cuda13", "tensorrt-llm")}
+    assert len(complete_source) == 11
 
 
 def test_release_matrix_fails_closed_for_absent_bundle(complete_source, tmp_path):
@@ -117,6 +127,103 @@ def test_build_commands_only_load_source_bound_images():
         )
 
 
+@pytest.mark.parametrize("bundle", ["sglang-cu130", "tensorrt-llm"])
+def test_release_cuda13_smoke_uses_qualified_driverless_checks(bundle, monkeypatch):
+    image = f"ghcr.io/superlinked/sie-server:v{VERSION}-cuda13-{bundle}"
+    commands = []
+    monkeypatch.setattr(docker_task, "run", commands.append)
+
+    docker_task.smoke_image(image, bundle=bundle)
+
+    assert commands == cuda13_image_smoke.docker_commands(bundle, image)
+    assert len(commands) == 2
+    for command in commands:
+        assert command[:7] == ["docker", "run", "--rm", "--pull", "never", "--network", "none"]
+        assert "HF_HUB_OFFLINE=1" in command
+        assert "TRANSFORMERS_OFFLINE=1" in command
+    assert commands[0][-2] == "-c"
+    assert commands[0][-1] == cuda13_image_smoke.validation_script(bundle)
+    assert "import tensorrt_llm" not in commands[0][-1]
+    assert "import sglang" not in commands[0][-1]
+    assert commands[1][-6:] == [image, "resolve-deps", "--bundle", bundle, "--models-dir", "/app/models"]
+
+
+@pytest.mark.parametrize(
+    ("bundle", "extra_import"),
+    [
+        ("default", ""),
+        ("transformers5", ""),
+        ("ctranslate2", "import ctranslate2; "),
+        ("sglang", "import sglang; "),
+        ("sglang-vision-extract", "import sglang; "),
+        (None, ""),
+    ],
+)
+def test_other_release_images_keep_existing_smoke_checks(bundle, extra_import, monkeypatch):
+    commands = []
+    monkeypatch.setattr(docker_task, "run", commands.append)
+    docker_task.smoke_image(IMAGE, bundle=bundle)
+    expected = ["docker", "run", "--rm", "--pull", "never", "--network", "none"]
+    if bundle is None:
+        expected.extend([IMAGE, "--help"])
+    else:
+        expected.extend(
+            [
+                "--entrypoint",
+                "python",
+                IMAGE,
+                "-c",
+                "import sie_server, sie_sdk, sie_audio_prep, torch, transformers; "
+                + extra_import
+                + "print('release image imports passed')",
+            ]
+        )
+    assert commands == [expected]
+
+
+@pytest.mark.parametrize("bundle", ["sglang-cu130", "tensorrt-llm"])
+@pytest.mark.parametrize("failed_check", ["imports", "resolve-deps"])
+def test_failed_cuda13_release_smoke_never_exports_image(bundle, failed_check, monkeypatch, tmp_path):
+    commands = []
+
+    def run(command):
+        commands.append(command)
+        if (failed_check == "imports" and "-c" in command) or (
+            failed_check == "resolve-deps" and "resolve-deps" in command
+        ):
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(docker_task, "run", run)
+    export = Mock()
+    monkeypatch.setattr(docker_task, "export_image", export)
+    monkeypatch.setattr(
+        docker_task.sys,
+        "argv",
+        [
+            "docker_task.py",
+            "build-server",
+            "--registry",
+            "ghcr.io/superlinked",
+            "--version",
+            VERSION,
+            "--platform",
+            "cuda13",
+            "--bundle",
+            bundle,
+            "--source-revision",
+            FULL_SHA,
+            "--run-id",
+            "1234",
+            "--archive-dir",
+            str(tmp_path / "artifact"),
+        ],
+    )
+
+    assert docker_task.main() == 1
+    export.assert_not_called()
+    assert len(commands) == (2 if failed_check == "imports" else 3)
+
+
 def test_complete_set_verified_before_alias_commands(complete_source, monkeypatch, tmp_path):
     commands = []
 
@@ -137,9 +244,9 @@ def test_complete_set_verified_before_alias_commands(complete_source, monkeypatc
     assert commands == []
 
 
-def test_expected_release_set_has_fifteen_tags_and_six_names(complete_source):
+def test_expected_release_set_has_sixteen_tags_and_six_names(complete_source):
     images = docker_task.expected_versioned_images("ghcr.io/superlinked", VERSION, complete_source)
-    assert len(images) == len(set(images)) == 15
+    assert len(images) == len(set(images)) == 16
     assert len({image.split(":")[0] for image in images}) == 6
     assert f"ghcr.io/superlinked/sie-server-rust:v{VERSION}-cuda12-sm89" in images
 
@@ -285,7 +392,7 @@ def test_failed_old_alias_retry_never_rolls_back_newer_success(complete_source, 
         run_id="1235",
     )
     newer_writes = writes[1:].copy()
-    assert len(newer_writes) == 15
+    assert len(newer_writes) == 16
     assert all(":v0.7.5" in command[-1] for command in newer_writes)
     docker_task.move_aliases("ghcr.io/superlinked", VERSION, complete_source, **kwargs)
     assert writes[1:] == newer_writes
@@ -298,7 +405,7 @@ def test_same_release_alias_retry_is_idempotent(complete_source, public_releases
     docker_task.move_aliases("ghcr.io/superlinked", VERSION, complete_source, **kwargs)
     first = writes.copy()
     docker_task.move_aliases("ghcr.io/superlinked", VERSION, complete_source, **kwargs)
-    assert len(first) == 15
+    assert len(first) == 16
     assert writes == first + first
 
 

@@ -26,12 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
         with:
           version: 2026.5.5
-          install_args: python uv
+          # Install everything here; later mise exec would auto-install omitted tools.
+          install_args: --jobs=1
       - name: Validate source and optional release identity
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,8 +42,12 @@ jobs:
           BUILD_ONLY: ${{ inputs.build_only }}
         run: |
           set -euo pipefail
-          if [ "$BUILD_ONLY" = false ]; then test -n "$RELEASE_VERSION"; fi
-          mise exec -- python tools/ci/release_guard.py build --source-ref "$SOURCE_REF" --version "$RELEASE_VERSION" --tag-name "$RELEASE_TAG"
+          if [ "$BUILD_ONLY" = true ]; then
+            mise exec -- python tools/ci/release_guard.py build --source-ref "$SOURCE_REF"
+          else
+            test -n "$RELEASE_VERSION"
+            mise exec -- python tools/ci/release_guard.py build --source-ref "$SOURCE_REF" --version "$RELEASE_VERSION" --tag-name "$RELEASE_TAG"
+          fi
       - name: Build complete archives and test clean packed consumers
         env:
           RELEASE_VERSION: ${{ inputs.version }}

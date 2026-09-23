@@ -962,6 +962,7 @@ export interface GenerationUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  images?: number;
   creditsCharged?: number;
   rateBookVersion?: string;
 }
@@ -1109,13 +1110,16 @@ export interface ChatMessage {
  * One content part inside a multimodal `messages[*].content` array. Text parts
  * (`text` / `input_text`) are concatenated; image parts (`image_url` /
  * `input_image`) carry a base64 `data:` URI and are accepted for vision-capable
- * generation models.
+ * generation models. One `video_url` part per request (a base64
+ * `data:video/<subtype>;base64,...` MP4/MOV, WebM/Matroska, or AVI container)
+ * is accepted for models that declare video input.
  */
 export type ChatContentPart =
   | { type: "text"; text: string }
   | { type: "input_text"; text: string }
   | { type: "image_url"; image_url: { url: string } }
-  | { type: "input_image"; image_url: string | { url: string } };
+  | { type: "input_image"; image_url: string | { url: string } }
+  | { type: "video_url"; video_url: { url: string } };
 
 /** A tool call emitted by the model. */
 export interface ToolCall {
@@ -1277,6 +1281,7 @@ export interface ChatUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  images?: number;
   credits_charged?: number;
   rate_book_version?: string;
 }
@@ -1416,6 +1421,14 @@ export interface GenerateChunk {
   usage?: ChatUsage;
   /** Time-to-first-token, milliseconds. Terminal chunk only. */
   ttft_ms?: number;
+  /**
+   * Worker-origin execution identity, only on a successful terminal chunk.
+   * Optional complete pair with execution_binding_sha256; both are lowercase
+   * 64-hex SHA-256 digests. Older or self-hosted deployments may omit both.
+   */
+  execution_identity_sha256?: string;
+  /** Worker-origin execution binding, with the same terminal complete-pair contract. */
+  execution_binding_sha256?: string;
   /** Populated when the worker / gateway errored mid-stream. */
   error?: GenerationChunkError;
 }

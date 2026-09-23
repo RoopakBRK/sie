@@ -78,7 +78,7 @@ from sie_server.adapters._generation_base import (
     suppress_thinking_blocks,
     thinking_blocks_must_be_hidden,
 )
-from sie_server.api.helpers import ModelStateChecker, oom_retry_after_from_registry
+from sie_server.api.helpers import ModelStateChecker, oom_retry_after_from_registry, read_bounded_request_body
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
 from sie_server.core.runtime_options import apply_generation_runtime_options
 from sie_server.core.tokenizer import image_first_chat_message, load_tokenizer
@@ -665,25 +665,6 @@ def _payload_too_large(message: str, *, param: str | None = None) -> HTTPExcepti
     return HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=detail)
 
 
-async def _read_bounded_request_body(request: Request, limit: int) -> bytes:
-    """Read an ASGI request without aggregating more than ``limit`` bytes."""
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError:
-            declared_length = -1
-        if declared_length > limit:
-            raise _payload_too_large(f"request body exceeds the limit of {limit} bytes")
-
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(chunk) > limit - len(body):
-            raise _payload_too_large(f"request body exceeds the limit of {limit} bytes")
-        body.extend(chunk)
-    return bytes(body)
-
-
 def _generation_http_exception(error: GenerationError, registry: ModelRegistry | None = None) -> HTTPException:
     """Map an expected adapter refusal without rewriting it as a 500."""
     if isinstance(
@@ -869,19 +850,18 @@ async def _stream_generate_events(
                     yield f"data: {json.dumps(event)}\n\n"
                     seq += 1
                 break
-            if chunk.text_delta or chunk.logprobs:
-                if chunk.text_delta and ttft_ms is None:
-                    ttft_ms = (time.perf_counter() - t0) * 1000.0
-                event: dict[str, Any] = {
-                    "request_id": request_id,
-                    "seq": seq,
-                    "text_delta": chunk.text_delta,
-                    "done": False,
-                }
-                if chunk.logprobs:
-                    event["logprobs"] = list(chunk.logprobs)
-                seq += 1
-                yield f"data: {json.dumps(event)}\n\n"
+            if chunk.text_delta and ttft_ms is None:
+                ttft_ms = (time.perf_counter() - t0) * 1000.0
+            event: dict[str, Any] = {
+                "request_id": request_id,
+                "seq": seq,
+                "text_delta": chunk.text_delta,
+                "done": False,
+            }
+            if chunk.logprobs:
+                event["logprobs"] = list(chunk.logprobs)
+            seq += 1
+            yield f"data: {json.dumps(event)}\n\n"
     except GenerationError as exc:
         terminal_outcome_selected = True
         logger.info("stream_generate refused after preflight: %s", exc)
@@ -969,6 +949,8 @@ async def _stream_generate_events(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+    if images and terminal_error is None and finish_reason not in {"error", "cancelled"}:
+        terminal["usage"]["images"] = len(images)
     if ttft_ms is not None:
         terminal["ttft_ms"] = ttft_ms
     if terminal_error is not None:
@@ -1058,7 +1040,7 @@ async def generate(
         if x_machine_profile:
             span.set_attribute("machine_profile", x_machine_profile)
 
-        raw_body = await _read_bounded_request_body(http_request, _MAX_GENERATE_BODY_BYTES)
+        raw_body = await read_bounded_request_body(http_request, _MAX_GENERATE_BODY_BYTES)
         try:
             body = json.loads(raw_body)
         except (json.JSONDecodeError, ValueError) as exc:
@@ -1388,6 +1370,7 @@ async def generate(
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
                     "total_tokens": result.prompt_tokens + result.completion_tokens,
+                    **({"images": len(images)} if images else {}),
                 },
             }
         )

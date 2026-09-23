@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from sie_sdk import SIEClient
 from sie_sdk.client.errors import RequestError, ResourceExhaustedError, ServerError
+from sie_sdk.types import GenerateChunk
 
 
 def _ok_json(payload: dict[str, Any]) -> MagicMock:
@@ -232,6 +233,29 @@ def test_stream_generate_yields_chunks_and_normalizes_model_path() -> None:
             "logprobs": True,
         }
         client.close()
+
+
+@pytest.mark.parametrize("with_evidence", [False, True])
+def test_stream_generate_preserves_optional_terminal_execution_evidence(with_evidence: bool) -> None:
+    terminal = GenerateChunk(request_id="request-1", seq=1, text_delta="", done=True, finish_reason="stop")
+    if with_evidence:
+        terminal.update(execution_identity_sha256="a" * 64, execution_binding_sha256="b" * 64)
+    delta = {"request_id": "request-1", "seq": 0, "text_delta": "Hello", "done": False}
+    with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+        mock_client.return_value.stream.return_value = _FakeStream(lines=_sse(delta, dict(terminal)))
+        with SIEClient("http://localhost:8080") as client:
+            client._request_state.last_model_revision = "c" * 64
+            chunks: list[GenerateChunk] = list(client.stream_generate("org/model", "hi", max_new_tokens=8))
+            assert client.last_model_revision is None
+    assert chunks[-1] == terminal
+    assert "execution_identity_sha256" not in chunks[0]
+    assert "execution_binding_sha256" not in chunks[0]
+    if with_evidence:
+        assert chunks[-1]["execution_identity_sha256"] == "a" * 64
+        assert chunks[-1]["execution_binding_sha256"] == "b" * 64
+    else:
+        assert "execution_identity_sha256" not in chunks[-1]
+        assert "execution_binding_sha256" not in chunks[-1]
 
 
 def test_stream_generate_validates_extra_body_grammar_before_request() -> None:

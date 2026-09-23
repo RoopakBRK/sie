@@ -462,6 +462,12 @@ class GenerateUsageModel(BaseModel):
     prompt_tokens: int = Field(..., ge=0, description="Number of prompt tokens")
     completion_tokens: int = Field(..., ge=0, description="Number of generated tokens")
     total_tokens: int = Field(..., ge=0, description="Total prompt and generated tokens")
+    images: int | None = Field(
+        default=None,
+        ge=1,
+        le=(1 << 32) - 1,
+        description="Observed input images on successful image-conditioned generation; omitted for text-only requests",
+    )
 
 
 class GenerateResponseModel(BaseModel):
@@ -714,3 +720,41 @@ class GenerateChunk(BaseModel):
         description="Per-token log probabilities aligned with text_delta",
     )
     error: GenerateChunkErrorModel | None = Field(default=None, description="Terminal generation error")
+    execution_identity_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "Optional worker-origin execution identity, only on a successful terminal event together with "
+            "execution_binding_sha256. Older or self-hosted deployments may omit both. "
+            "Distinct from the catalog weights revision and executed bundle/config hash."
+        ),
+    )
+    execution_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Optional worker-origin execution binding, with the same successful-terminal complete-pair contract",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "oneOf": [
+                {
+                    "required": ["execution_identity_sha256", "execution_binding_sha256"],
+                    "properties": {
+                        "done": {"const": True},
+                        "error": {"type": "null"},
+                        "execution_identity_sha256": {"type": "string"},
+                        "execution_binding_sha256": {"type": "string"},
+                    },
+                },
+                {
+                    "not": {
+                        "anyOf": [
+                            {"required": ["execution_identity_sha256"]},
+                            {"required": ["execution_binding_sha256"]},
+                        ]
+                    }
+                },
+            ]
+        }
+    }

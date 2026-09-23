@@ -24,6 +24,7 @@ from sie_server.adapters._generation_base import (
     GenerationDrainingError,
     GenerationError,
     GenerationInputTooLongError,
+    GenerationInvalidRequestError,
     GenerationUnsupportedFieldError,
 )
 from sie_server.adapters._spec import AdapterSpec
@@ -41,7 +42,7 @@ from sie_server.config.model import (
     Tasks,
 )
 from sie_server.core.registry import ModelRegistry
-from sie_server.types.grammar import GrammarSpec
+from sie_server.types.grammar import OUTLINES_JSON_SCHEMA_TYPE_MESSAGE, GrammarSpec
 from sie_server.types.inputs import ImageInput
 
 _GEMMA_OPEN = "<" + "|channel" + ">" + "thought\n"
@@ -393,17 +394,27 @@ class TestGenerateEndpoint:
             ]
             streamed_text = "".join(event.get("text_delta", "") for event in events)
             assert streamed_text == "Visible answer"
+            assert events[0]["text_delta"] == ""
+            assert events[0]["done"] is False
             assert "private reasoning" not in streamed_text
         else:
             assert response.json()["text"] == "Visible answer"
 
     @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "template_kwargs", [{"enable_thinking": False}, {"guardian_config": {"risk_name": "harm"}}]
+    )
     def test_text_only_generate_preserves_legacy_adapter_call_signature(
         self,
         client: TestClient,
         registry: MagicMock,
         stream: bool,
+        template_kwargs: dict[str, object],
     ) -> None:
+        config = _make_config()
+        assert config.tasks.generate is not None
+        config.tasks.generate.chat_template_kwargs = template_kwargs
+        registry.get_config.return_value = config
         legacy_adapter = _LegacyTextGenAdapter()
         registry.get.return_value = legacy_adapter
 
@@ -467,6 +478,11 @@ class TestGenerateEndpoint:
         assert fake_adapter.last_call is not None
         assert fake_adapter.last_call["prompt"] == "<image>Read the image"
         assert fake_adapter.last_call["images"] == [{"data": b"hello", "format": "png"}]
+        if stream:
+            chunks = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+            assert chunks[-1]["usage"]["images"] == 1
+        else:
+            assert response.json()["usage"]["images"] == 1
 
     @pytest.mark.parametrize("enable_thinking", [False, True])
     def test_native_image_prompt_uses_pinned_trusted_model_tokenizer(
@@ -1502,6 +1518,22 @@ class TestGenerateEndpoint:
         assert response.json()["detail"]["code"] == "unsupported_field"
         assert response.json()["detail"]["param"] == "top_k"
         assert adapter.events == ["preflight"]
+
+    def test_backend_type_refusal_is_actual_buffered_400(self, client: TestClient, registry: MagicMock) -> None:
+        adapter = _PreflightAdapter(
+            GenerationInvalidRequestError("grammar", OUTLINES_JSON_SCHEMA_TYPE_MESSAGE), raise_during_generate=True
+        )
+        registry.get.return_value = adapter
+        response = client.post(
+            "/v1/generate/Qwen__Qwen3-4B-Instruct", json={"prompt": "Optional value", "max_new_tokens": 8}
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == {
+            "code": "invalid_request",
+            "message": OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+            "param": "grammar",
+        }
+        assert adapter.events == ["preflight", "generate"]
 
     def test_preflight_input_too_long_is_exact_400(
         self,

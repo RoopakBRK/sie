@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from tools.ci import distributions
+from tools.ci import distributions, release_openapi
 from tools.ci.release_guard import SEED_VERSION, stable_version
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +73,60 @@ EXTRA_VERSION_PATHS = {
     "packages/sie_audio_prep/build_wheel.py",
     "deploy/helm/sie-cluster/Chart.yaml",
 }
+OPENAPI_VERSION_PATHS = {
+    "packages/sie_server/openapi.json",
+    "packages/sie_gateway/openapi.json",
+}
+OPENAPI_STAMP_COMMAND = "mise exec -- python -I tools/ci/release_openapi.py"
+SDK_PACKAGE_PATH = "packages/sie_ts_sdk/package.json"
+SDK_INSTALL_COMMAND = "mise exec -- pnpm --filter @superlinked/sie-sdk install --frozen-lockfile --ignore-scripts"
+SDK_FORMAT_COMMAND = "mise exec -- pnpm --dir packages/sie_ts_sdk exec biome format --write package.json"
+PLAIN_PATHS = r"((?:[\w.][\w./-]* )*[\w.][\w./-]*)"
+CONTRACTS_OPENAPI_COMMANDS = (
+    ("mise run openapi", re.compile(re.escape("- run: mise run openapi"))),
+    ("git diff", re.compile(rf"- run: git diff --exit-code -- {PLAIN_PATHS}")),
+)
+REFRESH_OPENAPI_COMMANDS = (
+    ("git checkout", re.compile(re.escape('git checkout -B "$branch" FETCH_HEAD'))),
+    ("tools/ci/release_openapi.py", re.compile(re.escape(OPENAPI_STAMP_COMMAND))),
+    ("git diff", re.compile(rf"if git diff --quiet -- {PLAIN_PATHS}; then")),
+    ("git add", re.compile(rf"git add {PLAIN_PATHS}")),
+    ("git commit", re.compile(r"git commit -m '[^'\\]*'")),
+    ("git push", re.compile(re.escape('git push origin "HEAD:refs/heads/$branch"'))),
+)
+REFRESH_METADATA_COMMANDS = (
+    REFRESH_OPENAPI_COMMANDS[0],
+    ("pnpm install", re.compile(re.escape("mise exec -- pnpm install --lockfile-only"))),
+    ("pnpm --filter", re.compile(re.escape(SDK_INSTALL_COMMAND))),
+    ("biome", re.compile(re.escape(SDK_FORMAT_COMMAND))),
+    *REFRESH_OPENAPI_COMMANDS[2:],
+)
+SHELL_CONTROL_FLOW = frozenset(
+    {
+        "if",
+        "elif",
+        "else",
+        "fi",
+        "while",
+        "until",
+        "for",
+        "do",
+        "done",
+        "case",
+        "esac",
+        "function",
+        "exit",
+        "return",
+        "trap",
+        "eval",
+        "source",
+        ".",
+        "{",
+        "}",
+        "(",
+        ")",
+    }
+)
 ACTION_PIN = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 JOB_FIELD_INDENT = 4
 ARTIFACT_RETENTION_DAYS = 30
@@ -101,6 +155,7 @@ MPL_LICENSE_EXCEPTION_NAMES = frozenset(
 AUDIO_MANYLINUX_IMAGE = (
     "quay.io/pypa/manylinux_2_28_x86_64@sha256:4dc41da7df20400310c80d162a2fe2d2c2f3d9734d8dec20f6b9843711618deb"
 )
+AUDIO_SOURCE_ASSERTION = 'test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$RELEASE_SHA"'
 TRUSTED_WRITE_CONDITION_TERMS = (
     "inputs.publish == true",
     "vars.PUBLIC_RELEASE_PUBLISHING_ENABLED == 'true'",
@@ -116,12 +171,12 @@ TRUSTED_WRITE_CONDITION_TERMS = (
 PUBLISHER_JOBS = (
     (".github/workflows/release.yml", "python-publish", "pypi", {"contents": "read", "id-token": "write"}),
     (".github/workflows/release.yml", "npm-publish", "npm", {"contents": "read", "id-token": "write"}),
-    (".github/workflows/release-audio.yml", "publish", "github-release", {"contents": "write"}),
-    (".github/workflows/release-native.yml", "publish", "github-release", {"contents": "write"}),
-    (".github/workflows/release-docker.yml", "push-server", "ghcr", {"contents": "read", "packages": "write"}),
-    (".github/workflows/release-docker.yml", "push-service", "ghcr", {"contents": "read", "packages": "write"}),
-    (".github/workflows/release-docker.yml", "alias", "ghcr", {"contents": "read", "packages": "write"}),
-    (".github/workflows/release-helm.yml", "publish", "helm", {"contents": "read", "packages": "write"}),
+    (".github/workflows/publish-audio.yml", "publish", "github-release", {"contents": "write"}),
+    (".github/workflows/publish-native.yml", "publish", "github-release", {"contents": "write"}),
+    (".github/workflows/publish-docker.yml", "push-server", "ghcr", {"contents": "read", "packages": "write"}),
+    (".github/workflows/publish-docker.yml", "push-service", "ghcr", {"contents": "read", "packages": "write"}),
+    (".github/workflows/publish-docker.yml", "alias", "ghcr", {"contents": "read", "packages": "write"}),
+    (".github/workflows/publish-helm.yml", "publish", "helm", {"contents": "read", "packages": "write"}),
 )
 
 CANDLE_PATHS = (
@@ -329,6 +384,105 @@ def release_config_errors() -> list[str]:
     for path in extra_paths:
         if not (ROOT / path).is_file():
             errors.append(f"release-please extra file does not exist: {path}")
+    if extra_paths & OPENAPI_VERSION_PATHS:
+        errors.append("generated OpenAPI documents must be stamped, not rewritten by release-please")
+    errors.extend(
+        release_openapi_errors(
+            workflow_job_blocks(".github/workflows/release.yml").get("release-please", ""),
+            workflow_job_blocks(".github/workflows/ci.yml").get("contracts", ""),
+            set(release_openapi.OPENAPI_VERSION_SOURCES),
+        )
+    )
+    return errors
+
+
+def step_lines(block: str) -> list[str]:
+    """Strip workflow lines, joining each folded `>-` scalar onto its key line."""
+    lines: list[str] = []
+    continuation: int | None = None
+    for raw in block.splitlines():
+        indent = len(raw) - len(raw.lstrip())
+        if continuation is not None and raw.strip() and indent >= continuation:
+            lines[-1] = f"{lines[-1]} {raw.strip()}"
+            continue
+        continuation = None
+        line = raw.strip()
+        if line.endswith(": >-"):
+            continuation = indent + (4 if line.startswith("- ") else 2)
+            line = line.removesuffix(" >-")
+        lines.append(line)
+    return lines
+
+
+def exact_commands(
+    lines: list[str], commands: tuple[tuple[str, re.Pattern[str]], ...]
+) -> list[tuple[int, re.Match[str]]] | None:
+    """Match each command on the only line that mentions it, requiring the commands in order."""
+    found: list[tuple[int, re.Match[str]]] = []
+    for marker, command in commands:
+        indexes = [index for index, line in enumerate(lines) if marker in line]
+        match = command.fullmatch(lines[indexes[0]]) if len(indexes) == 1 else None
+        if match is None or (found and indexes[0] <= found[-1][0]):
+            return None
+        found.append((indexes[0], match))
+    return found
+
+
+def step_bounds(lines: list[str], index: int) -> tuple[int, int]:
+    """Return the line range of the workflow step holding the given line."""
+    start = next((position for position in range(index, -1, -1) if lines[position].startswith("- ")), 0)
+    end = next((position for position in range(index + 1, len(lines)) if lines[position].startswith("- ")), len(lines))
+    return start, end
+
+
+def refresh_control_flow(lines: list[str], commands: list[tuple[int, re.Match[str]]]) -> list[str]:
+    """Return the shell control-flow lines of every step that runs one of the commands."""
+    steps = sorted({step_bounds(lines, index) for index, _ in commands})
+    shell = [line for start, end in steps for line in lines[start:end]]
+    return [line for line in shell if line.split(" ")[0].removesuffix(";") in SHELL_CONTROL_FLOW]
+
+
+def release_openapi_errors(refresh: str, contracts: str, stamped: set[str]) -> list[str]:
+    def documents(match: re.Match[str]) -> set[str]:
+        return set(re.findall(r"[\w/]+/openapi\.json", match.group(1)))
+
+    def ends_step(lines: list[str], index: int) -> bool:
+        return index + 1 == len(lines) or not lines[index + 1] or lines[index + 1].startswith("- ")
+
+    errors: list[str] = []
+    if stamped != OPENAPI_VERSION_PATHS:
+        errors.append("release OpenAPI version stamping differs from the public contract")
+    contract_lines = step_lines(contracts)
+    regenerated = exact_commands(contract_lines, CONTRACTS_OPENAPI_COMMANDS)
+    if (
+        regenerated is None
+        or documents(regenerated[-1][1]) != OPENAPI_VERSION_PATHS
+        or not all(ends_step(contract_lines, index) for index, _ in regenerated)
+        or any(line.startswith("continue-on-error") for line in contract_lines)
+    ):
+        errors.append("CI / Contracts must regenerate and then diff exactly the stamped OpenAPI documents")
+    refresh_lines = step_lines(refresh)
+    refreshed = exact_commands(refresh_lines, REFRESH_OPENAPI_COMMANDS)
+    if (
+        refreshed is None
+        or any(documents(match) != OPENAPI_VERSION_PATHS for _, match in refreshed[2:4])
+        or any(line.startswith(("set +", "shell:", "continue-on-error")) for line in refresh_lines)
+        or refresh_control_flow(refresh_lines, refreshed) != [refresh_lines[refreshed[2][0]], "exit 0", "fi"]
+    ):
+        errors.append(
+            "release PR refresh must run checkout, OpenAPI stamp, diff, add, commit, and push once each, "
+            "in order, as exact commands without failure suppression"
+        )
+    metadata = exact_commands(refresh_lines, REFRESH_METADATA_COMMANDS)
+    if (
+        metadata is None
+        or any(SDK_PACKAGE_PATH not in match.group(1).split() for _, match in metadata[4:6])
+        or len({step_bounds(refresh_lines, index) for index, _ in metadata}) != 1
+    ):
+        errors.append(
+            "release PR refresh must refresh the pnpm lock, install the SDK's pinned formatter, and format "
+            "its package.json before diff and staging, in the same step as checkout, commit, and push"
+        )
     return errors
 
 
@@ -386,13 +540,18 @@ def release_workflow_errors() -> list[str]:
     for family in ("python", "npm", "audio", "docker", "helm", "native"):
         if f"uses: ./.github/workflows/release-{family}.yml" not in top:
             errors.append(f"top-level release does not call {family} directly")
-    for family in ("python", "npm"):
+    for family in ("python", "npm", "docker", "helm", "audio", "native"):
         text = (ROOT / f".github/workflows/release-{family}.yml").read_text()
-        if "id-token:" in text or "environment:" in text or "  publish:" in text:
+        if "id-token:" in text or "environment:" in text or ": write" in text or "  publish:" in text:
             errors.append(f"{family} reusable must only build and test")
-        if f"distributions.py build {family}" not in text or "inputs.source_ref" not in text:
+        if family in ("python", "npm") and (
+            f"distributions.py build {family}" not in text or "inputs.source_ref" not in text
+        ):
             errors.append(f"{family} reusable lacks exact-source distribution checks")
-    for path in sorted((ROOT / ".github/workflows").glob("release*.yml")):
+    paths = set((ROOT / ".github/workflows").glob("release*.yml")) | set(
+        (ROOT / ".github/workflows").glob("publish-*.yml")
+    )
+    for path in sorted(paths):
         text = path.read_text()
         for token_name in ("PYPI_TOKEN", "NPM_TOKEN", "NODE_AUTH_TOKEN"):
             if token_name in text:
@@ -400,15 +559,54 @@ def release_workflow_errors() -> list[str]:
         for retention in re.findall(r"retention-days:\s*(\d+)", text):
             if int(retention) < ARTIFACT_RETENTION_DAYS:
                 errors.append(f"{path.name} expires retry artifacts before 30 days")
-        if path.name != "release.yml" and "workflow_dispatch" in text:
+        if path.name not in {"release.yml", "release-candidate.yml"} and "workflow_dispatch" in text:
             errors.append(f"{path.name} must not expose a separate recovery writer")
     blocks = workflow_job_blocks(".github/workflows/release.yml")
     prepare = blocks.get("prepare", "")
     if "release_guard.py prepare" not in prepare or "ref: ${{ github.sha }}" not in prepare:
         errors.append("publication must prepare the exact published tag event")
-    for family in ("python", "npm", "docker", "helm", "audio", "native", "python-publish", "npm-publish"):
+    for family in (
+        "python",
+        "npm",
+        "docker-build",
+        "helm-build",
+        "audio-build",
+        "native-build",
+        "docker",
+        "helm",
+        "audio",
+        "native",
+        "python-publish",
+        "npm-publish",
+    ):
         if "needs.prepare" not in blocks.get(family, "") or "needs.release-please" in blocks.get(family, ""):
             errors.append(f"{family} must consume the published-release prepare identity")
+    barrier = blocks.get("artifacts-ready", "")
+    if (
+        job_scalar(barrier, "needs") != "[prepare, python, npm, docker-build, helm-build, audio-build, native-build]"
+        or "always()" not in barrier
+        or 'job["result"] != "success"' not in barrier
+        or "raise SystemExit" not in barrier
+    ):
+        errors.append("every artifact family must succeed before the publication barrier opens")
+    for family in ("python-publish", "npm-publish", "docker", "helm", "audio", "native"):
+        block = blocks.get(family, "")
+        if "artifacts-ready" not in (
+            job_scalar(block, "needs") or ""
+        ) or "needs.artifacts-ready.result == 'success'" not in (job_scalar(block, "if") or ""):
+            errors.append(f"{family} must wait for the complete tested artifact set")
+    for family in ("docker", "helm", "audio", "native"):
+        if f"uses: ./.github/workflows/publish-{family}.yml" not in blocks.get(family, ""):
+            errors.append(f"{family} must publish retained archives through its guarded publisher")
+    for family in ("helm", "native"):
+        if job_scalar(blocks.get(family, ""), "needs") != "[prepare, artifacts-ready, docker]":
+            errors.append(f"{family} publication must follow verified versioned images")
+    candidate = (ROOT / ".github/workflows/release-candidate.yml").read_text()
+    if any(
+        item in candidate
+        for item in (": write", "environment:", "id-token:", "uses: ./.github/workflows/publish-", "secrets.")
+    ):
+        errors.append("release candidate rehearsal must be read-only and unable to publish")
     errors.extend(release_queue_errors(top, (ROOT / ".github/workflows/ci.yml").read_text()))
     recover = blocks.get("recover", "")
     if "release_recovery" not in recover or "id-token:" in recover or "publish-" in recover:
@@ -416,7 +614,10 @@ def release_workflow_errors() -> list[str]:
     complete = blocks.get("complete", "")
     if "always()" not in complete or 'job["result"] != "success"' not in complete:
         errors.append("release completion must reject every non-success result")
-    if job_scalar(complete, "needs") != "[prepare, python-publish, npm-publish, docker, helm, audio, native]":
+    if (
+        job_scalar(complete, "needs")
+        != "[prepare, artifacts-ready, python-publish, npm-publish, docker, helm, audio, native]"
+    ):
         errors.append("release completion must include every artifact family")
     if (ROOT / ".github/workflows/repair-audio-asset.yml").exists():
         errors.append("obsolete audio repair workflow must be removed")
@@ -493,6 +694,60 @@ def audio_release_contract() -> tuple[str, str, str]:
     return version, filename, url
 
 
+def default_run_shell(block: str, indent: int) -> str | None:
+    """Read defaults.run.shell from block mappings; unsupported forms fail closed."""
+    lines = block.splitlines()
+    for key in ("defaults", "run", "shell"):
+        prefix = f"{' ' * indent}{key}:"
+        found = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+        if not found:
+            return None
+        if len(found) != 1:
+            return ""
+        start = found[0]
+        value = lines[start].removeprefix(prefix).strip()
+        if key == "shell":
+            return value
+        if value:
+            return ""
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if lines[index].strip()
+                and not lines[index].lstrip().startswith("#")
+                and len(lines[index]) - len(lines[index].lstrip()) <= indent
+            ),
+            len(lines),
+        )
+        lines = lines[start + 1 : end]
+        indent += 2
+    return None
+
+
+def audio_checkout_errors(build: str, workflow: str) -> list[str]:
+    """Require the container's exact-source check to trust only its current workspace."""
+    lines = step_lines(build)
+    assertion = exact_commands(lines, (("rev-parse", re.compile(re.escape(AUDIO_SOURCE_ASSERTION))),))
+    shell = default_run_shell(build, JOB_FIELD_INDENT)
+    if shell is None:
+        shell = default_run_shell(workflow, 0)
+    if assertion is not None:
+        start, end = step_bounds(lines, assertion[0][0])
+        active = [line.removeprefix("- ") for line in lines[start:end]]
+        if (
+            shell == "bash"
+            and "set -euo pipefail" in active
+            and job_scalar(build, "if") is None
+            and job_scalar(build, "continue-on-error") is None
+            and not any(line.startswith(("if:", "continue-on-error:", "shell:", "set +")) for line in active)
+            and not refresh_control_flow(lines, assertion)
+            and build.count("safe.directory") == 1
+        ):
+            return []
+    return ["native audio source check must compare the exact SHA with command-scoped workspace Git trust"]
+
+
 def audio_release_errors() -> list[str]:
     errors: list[str] = []
     version, filename, url = audio_release_contract()
@@ -504,16 +759,20 @@ def audio_release_errors() -> list[str]:
     if mise_tools.get("zig") != "0.13.0":
         errors.append("native audio release must pin Zig 0.13.0")
     rust = mise_tools.get("rust", {})
-    if not isinstance(rust, dict) or rust.get("version") != "1.97.0":
-        errors.append("native audio release must use the repository Rust 1.97.0 pin")
+    if not isinstance(rust, dict) or rust.get("version") != "1.98.1":
+        errors.append("native audio release must use the repository Rust 1.98.1 pin")
     workflow = (ROOT / ".github/workflows/release-audio.yml").read_text()
+    errors.extend(
+        audio_checkout_errors(workflow_job_blocks(".github/workflows/release-audio.yml").get("build", ""), workflow)
+    )
+    workflow += (ROOT / ".github/workflows/publish-audio.yml").read_text()
     required = (
         "ref: ${{ inputs.sha }}",
         AUDIO_MANYLINUX_IMAGE,
         "version: 2026.7.11",
-        "mise --no-config install python@3.12.12 uv@0.5.31 zig@0.13.0 rust@1.97.0",
-        "rust@1.97.0 -- rustc --version",
-        "rust@1.97.0 -- cargo --version",
+        "mise --no-config install python@3.12.12 uv@0.5.31 zig@0.13.0 rust@1.98.1",
+        "rust@1.98.1 -- rustc --version",
+        "rust@1.98.1 -- cargo --version",
         "python tools/ci/build_audio_prep_release_asset.py --out dist",
         expected_filename.replace(version, "$RELEASE_VERSION"),
         "tools/ci/upload_audio_prep_release_asset.bash",
@@ -672,7 +931,7 @@ def docker_release_errors() -> list[str]:
         (platform, bundle)
         for platform in ("cuda12", "cpu")
         for bundle in ("default", "ctranslate2", "sglang", "transformers5")
-    } | {("cuda13", "sglang-cu130"), ("cuda13", "tensorrt-llm")}
+    } | {("cuda12", "sglang-vision-extract"), ("cuda13", "sglang-cu130"), ("cuda13", "tensorrt-llm")}
     if pairs != expected_pairs:
         errors.append("Docker release matrix differs from the supported server pairs")
 
@@ -681,7 +940,7 @@ def docker_release_errors() -> list[str]:
     if chart_images != PUBLIC_IMAGE_NAMES:
         errors.append(f"chart-advertised SIE repositories differ from release set: {sorted(chart_images)}")
 
-    workflow = (ROOT / ".github/workflows/release-docker.yml").read_text()
+    workflow = (ROOT / ".github/workflows/publish-docker.yml").read_text()
     if "inputs.publish == true" not in workflow or "PUBLIC_RELEASE_PUBLISHING_ENABLED == 'true'" not in workflow:
         errors.append("Docker release is missing its dual publication latch")
     if "needs: [matrix, verify]" not in workflow:
@@ -705,13 +964,13 @@ def helm_release_errors() -> list[str]:
         errors.append("Helm Chart version and appVersion must share the vX.Y.Z release identity")
 
     workflow = (ROOT / ".github/workflows/release-helm.yml").read_text()
+    workflow += (ROOT / ".github/workflows/publish-helm.yml").read_text()
     required = (
         "ref: ${{ inputs.sha }}",
         "mise run helm -- dependencies",
         "mise run helm -- lint --set payloadStore.enabled=false",
         "mise run helm -- template --set payloadStore.enabled=false",
-        "helm package deploy/helm/sie-cluster",
-        "needs: build",
+        "mise run helm -- package --destination artifact",
         "inputs.publish == true",
         "PUBLIC_RELEASE_PUBLISHING_ENABLED == 'true'",
         "packages: write",

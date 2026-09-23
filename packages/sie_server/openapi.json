@@ -3,7 +3,7 @@
   "info": {
     "title": "SIE Server",
     "description": "Search Inference Engine - GPU inference server for search workloads",
-    "version": "0.7.3"
+    "version": "0.8.2"
   },
   "paths": {
     "/healthz": {
@@ -135,6 +135,9 @@
           "404": {
             "description": "Model not found"
           },
+          "413": {
+            "description": "Request body exceeds the configured size limit"
+          },
           "502": {
             "description": "Terminal model-load failure (MODEL_LOAD_FAILED). Carried in the ``detail`` envelope: ``{code, message, error_class, permanent, attempts}``. No ``Retry-After`` header \u2014 clients MUST NOT auto-retry."
           },
@@ -237,6 +240,9 @@
           },
           "404": {
             "description": "Model not found"
+          },
+          "413": {
+            "description": "Request body exceeds the configured size limit"
           },
           "502": {
             "description": "Terminal model-load failure (MODEL_LOAD_FAILED). Carried in the ``detail`` envelope: ``{code, message, error_class, permanent, attempts}``. No ``Retry-After`` header \u2014 clients MUST NOT auto-retry."
@@ -447,6 +453,9 @@
           },
           "404": {
             "description": "Model not found"
+          },
+          "413": {
+            "description": "Request body exceeds the configured size limit"
           },
           "502": {
             "description": "Terminal model-load failure (MODEL_LOAD_FAILED). Carried in the ``detail`` envelope: ``{code, message, error_class, permanent, attempts}``. No ``Retry-After`` header \u2014 clients MUST NOT auto-retry."
@@ -1402,6 +1411,20 @@
             "minimum": 0.0,
             "title": "Total Tokens",
             "description": "Total prompt and generated tokens"
+          },
+          "images": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 4294967295.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Images",
+            "description": "Observed input images on successful image-conditioned generation; omitted for text-only requests"
           }
         },
         "type": "object",
@@ -3029,6 +3052,44 @@
       },
       "GenerateChunk": {
         "description": "One SIE-native Server-Sent Event from a streaming generate request.",
+        "oneOf": [
+          {
+            "properties": {
+              "done": {
+                "const": true
+              },
+              "error": {
+                "type": "null"
+              },
+              "execution_identity_sha256": {
+                "type": "string"
+              },
+              "execution_binding_sha256": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "execution_identity_sha256",
+              "execution_binding_sha256"
+            ]
+          },
+          {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "execution_identity_sha256"
+                  ]
+                },
+                {
+                  "required": [
+                    "execution_binding_sha256"
+                  ]
+                }
+              ]
+            }
+          }
+        ],
         "properties": {
           "request_id": {
             "description": "Request id shared by every event in the stream",
@@ -3118,6 +3179,34 @@
             ],
             "default": null,
             "description": "Terminal generation error"
+          },
+          "execution_identity_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional worker-origin execution identity, only on a successful terminal event together with execution_binding_sha256. Older or self-hosted deployments may omit both. Distinct from the catalog weights revision and executed bundle/config hash.",
+            "title": "Execution Identity Sha256"
+          },
+          "execution_binding_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional worker-origin execution binding, with the same successful-terminal complete-pair contract",
+            "title": "Execution Binding Sha256"
           }
         },
         "required": [

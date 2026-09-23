@@ -21,6 +21,8 @@ authority.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import math
@@ -51,6 +53,12 @@ from sie_server.config.model import validate_chat_template_kwargs
 from sie_server.core.inference_output import ScoreOutput
 from sie_server.core.score_cost import MAX_SCORE_ITEMS, build_score_prepared_items
 from sie_server.core.timing import RequestTiming
+from sie_server.core.video_frames import (
+    MAX_VIDEO_BYTES,
+    VideoDecodeError,
+    check_generation_video_bounds,
+    sniff_video_container,
+)
 from sie_server.observability.tracing import tracer
 from sie_server.processors.streaming import _decode_data_uri_image
 from sie_server.types.inputs import Item
@@ -74,6 +82,7 @@ _MAX_BODY_BYTES = int(os.environ.get("SIE_CHAT_MAX_BODY_BYTES", str(8 * 1024 * 1
 _MAX_CHAT_RESPONSE_BYTES = int(os.environ.get("SIE_CHAT_MAX_RESPONSE_BYTES", str(32 * 1024 * 1024)))
 _MAX_CHAT_MESSAGES = 4096
 _MAX_CHAT_CHOICES = 128
+_MAX_CHAT_VIDEOS = 1
 _MAX_U32 = (1 << 32) - 1
 _ALLOWED_CHAT_ROLES = frozenset({"system", "user", "assistant", "tool", "developer"})
 # Compatibility requests project onto the same native score bound.
@@ -340,6 +349,12 @@ def _validate_chat_messages(messages: list[Any]) -> None:
                         f"'{part_path}.image_url' is required for image content parts",
                         param=f"{part_path}.image_url",
                     )
+            elif part_type == "video_url":
+                if "video_url" not in part_obj:
+                    raise _bad_request(
+                        f"'{part_path}.video_url' is required for video content parts",
+                        param=f"{part_path}.video_url",
+                    )
             else:
                 raise _bad_request(
                     f"unsupported content part type {part_type!r}",
@@ -397,8 +412,44 @@ def _validate_mlx_chat_body(body: dict[str, Any]) -> None:
         raise _bad_request(f"field '{unknown}' is not supported", param=unknown, code="unsupported_field")
 
 
-def _validate_chat_message_media(messages: Any) -> None:
-    """Reject child-side remote media fetches before proxying to a child."""
+def _decode_data_uri_video(url: str) -> tuple[bytes, str]:
+    """Decode an inline video data URI into ``(bytes, decoder suffix)``.
+
+    The container is identified from its magic bytes, never the declared media
+    type: FFmpeg picks its demuxer by content, so a playlist or concat script
+    labelled ``video/mp4`` must not reach it.
+    """
+    if not url.startswith("data:"):
+        raise ValueError("video content must be an inline base64 'data:' URI; remote URL fetching is not supported")
+    header, sep, payload = url[len("data:") :].partition(",")
+    if not sep:
+        raise ValueError("malformed video data URI (missing ',')")
+    params = header.split(";")
+    if "base64" not in params[1:]:
+        raise ValueError("video data URI must be base64-encoded")
+    media_type, _, subtype = params[0].partition("/")
+    if media_type != "video" or not subtype:
+        raise ValueError("video data URI must have a video/<subtype> media type")
+    if (len(payload) * 3) // 4 > MAX_VIDEO_BYTES:
+        raise ValueError(f"video too large: exceeds the {MAX_VIDEO_BYTES}-byte limit")
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"invalid base64 video data: {exc}") from exc
+    if not data:
+        raise ValueError("video data URI decoded to empty bytes")
+    container = sniff_video_container(data)
+    if container is None:
+        raise ValueError("video data must be an MP4/MOV, WebM/Matroska, or AVI container")
+    return data, f".{container}"
+
+
+def _validate_chat_message_media(messages: Any) -> list[tuple[str, bytes, str]]:
+    """Reject child-side remote media fetches before proxying to a child.
+
+    Returns every inline video as ``(param path, bytes, decoder suffix)``.
+    """
+    videos: list[tuple[str, bytes, str]] = []
 
     def _walk(value: Any, path: str) -> None:
         if isinstance(value, list):
@@ -421,7 +472,25 @@ def _validate_chat_message_media(messages: Any) -> None:
                 except ValueError as exc:
                     raise _bad_request(str(exc), param=item_path) from exc
                 continue
-            if key in {"audio_url", "video_url"}:
+            if key == "video_url":
+                url = item.get("url") if isinstance(item, dict) else None
+                if not isinstance(item, dict) or item.keys() != {"url"} or not isinstance(url, str) or not url:
+                    raise _bad_request(
+                        f"'{item_path}' must be an object with only a non-empty 'url'",
+                        param=item_path,
+                    )
+                if len(videos) >= _MAX_CHAT_VIDEOS:
+                    raise _bad_request(
+                        f"'messages' exceeds the maximum of {_MAX_CHAT_VIDEOS} video part(s) per request",
+                        param=item_path,
+                    )
+                try:
+                    data, suffix = _decode_data_uri_video(url)
+                except ValueError as exc:
+                    raise _bad_request(str(exc), param=item_path) from exc
+                videos.append((item_path, data, suffix))
+                continue
+            if key == "audio_url":
                 raise _bad_request(
                     f"'{item_path}' is not supported; remote media fetching is disabled",
                     param=item_path,
@@ -430,6 +499,15 @@ def _validate_chat_message_media(messages: Any) -> None:
             _walk(item, item_path)
 
     _walk(messages, "messages")
+    return videos
+
+
+def _probe_chat_videos(videos: list[tuple[str, bytes, str]]) -> None:
+    for path, data, suffix in videos:
+        try:
+            check_generation_video_bounds(data, suffix=suffix)
+        except VideoDecodeError as exc:
+            raise _bad_request(str(exc), param=path) from exc
 
 
 def _validated_child_chat_url(server_url: object) -> str:
@@ -808,7 +886,7 @@ async def _chat_completions(
             param="messages",
         )
     _validate_chat_messages(messages)
-    _validate_chat_message_media(messages)
+    videos = _validate_chat_message_media(messages)
     chat_template_kwargs = body.get("chat_template_kwargs")
     if chat_template_kwargs is not None and not isinstance(chat_template_kwargs, dict):
         raise _bad_request("'chat_template_kwargs' must be an object", param="chat_template_kwargs")
@@ -848,6 +926,15 @@ async def _chat_completions(
                 param="stream",
                 code="unsupported_field",
             )
+        if videos:
+            if not (config.inputs.video and str(device).startswith("cuda")):
+                raise _bad_request(
+                    f"Model '{model}' does not accept video input on this device",
+                    param="messages",
+                    code="unsupported_field",
+                )
+            # The child decodes video on its event loop; bound that work here.
+            await asyncio.to_thread(_probe_chat_videos, videos)
         if str(device).startswith("cuda"):
             _validate_cuda_chat_body(body)
         else:

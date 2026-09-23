@@ -198,6 +198,76 @@ def extract_frames(video: Any, *, max_frames: int = MAX_SAMPLED_FRAMES) -> list[
             capture.release()
 
 
+def sniff_video_container(data: bytes) -> str | None:
+    """Identify an MP4/MOV, WebM/Matroska, or AVI container from its magic bytes.
+
+    FFmpeg selects its demuxer by content, so callers that forward bytes to a
+    decoder must gate on this rather than on a declared media type.
+    """
+    if data[4:8] == b"ftyp":
+        return "mp4"
+    if data[:4] == b"\x1a\x45\xdf\xa3":
+        return "mkv"
+    if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return "avi"
+    return None
+
+
+# Generation-path decode rails. The generation runtime decodes a clip on its
+# own request loop, seeking from the preceding keyframe for every sampled
+# frame, so work scales with the stream's frame count and frame size rather
+# than with the frames it keeps.
+MAX_GENERATION_VIDEO_FRAMES: Final[int] = 3600
+MAX_GENERATION_VIDEO_FPS: Final[float] = 120.0
+MAX_GENERATION_VIDEO_FRAME_PIXELS: Final[int] = 1920 * 1080
+
+
+def check_generation_video_bounds(data: bytes, *, suffix: str) -> None:
+    """Admit a clip for generation only if its container metadata is within the decode rails.
+
+    Reads metadata without decoding frames. Fails closed on a container the
+    decoder cannot open or that reports no usable dimensions, frame count, or
+    frame rate, and enforces the byte, duration, frame-count, frame-rate, and
+    frame-size caps.
+
+    Raises:
+        VideoDecodeError: on any of the above.
+    """
+    if not data:
+        raise VideoDecodeError("video input carries no data")
+    if len(data) > MAX_VIDEO_BYTES:
+        msg = f"video input is {len(data)} bytes, exceeding the {MAX_VIDEO_BYTES}-byte admission cap"
+        raise VideoDecodeError(msg)
+    cv2 = _load_decoder()
+    with tempfile.NamedTemporaryFile(suffix=suffix) as handle:
+        handle.write(data)
+        handle.flush()
+        capture = cv2.VideoCapture(handle.name)
+        try:
+            if not capture.isOpened():
+                raise VideoDecodeError("video input could not be opened by the decoder")
+            total = _validated_frame_total(cv2, capture)
+            width = float(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
+            height = float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        finally:
+            capture.release()
+    if total is None or not all(math.isfinite(v) and v > 0 for v in (width, height)):
+        raise VideoDecodeError("video input does not report usable dimensions, frame count, and frame rate")
+    if total > MAX_GENERATION_VIDEO_FRAMES:
+        msg = f"video input has {total} frames, exceeding the {MAX_GENERATION_VIDEO_FRAMES}-frame cap"
+        raise VideoDecodeError(msg)
+    if fps > MAX_GENERATION_VIDEO_FPS:
+        msg = f"video input is {fps:.1f} fps, exceeding the {MAX_GENERATION_VIDEO_FPS:.0f} fps cap"
+        raise VideoDecodeError(msg)
+    if int(width) * int(height) > MAX_GENERATION_VIDEO_FRAME_PIXELS:
+        msg = (
+            f"video resolution {int(width)}x{int(height)} exceeds the "
+            f"{MAX_GENERATION_VIDEO_FRAME_PIXELS}-pixel frame limit"
+        )
+        raise VideoDecodeError(msg)
+
+
 def _load_decoder() -> Any:
     """Import the OpenCV decoder, failing closed when the image lacks it.
 

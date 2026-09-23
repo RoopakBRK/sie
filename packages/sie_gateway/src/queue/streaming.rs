@@ -200,6 +200,8 @@ pub struct UsageBlock {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -274,6 +276,7 @@ pub(crate) fn client_safe_worker_error_code(code: &str) -> &'static str {
         openai_code::CANCELLED => openai_code::CANCELLED,
         openai_code::CONTEXT_EXCEEDED => openai_code::CONTEXT_EXCEEDED,
         openai_code::EMPTY_MODEL_OUTPUT => openai_code::EMPTY_MODEL_OUTPUT,
+        openai_code::INVALID_GUARD_VERDICT => openai_code::INVALID_GUARD_VERDICT,
         "grammar_invalid" => "grammar_invalid",
         "invalid_request" => "invalid_request",
         "parallel_tool_calls_violated" => "parallel_tool_calls_violated",
@@ -331,6 +334,7 @@ const CLIENT_SAFE_UNSUPPORTED_GENERATION_PARAMS: &[&str] = &[
     "logprobs",
     "top_logprobs",
     "images",
+    "videos",
     "stream",
 ];
 
@@ -1097,6 +1101,10 @@ impl StreamCollector {
             Some(self.logprobs.clone())
         };
 
+        let complete_execution_evidence = self.execution_identity_consistent
+            && self.execution_binding_consistent
+            && self.execution_identity_sha256.is_some()
+            && self.execution_binding_sha256.is_some();
         Some(StreamOutcome {
             text,
             finish_reason: meta.finish_reason.clone(),
@@ -1110,12 +1118,10 @@ impl StreamCollector {
             logprobs,
             candidates: meta.candidates.clone(),
             executed_bundle_config_hash: meta.executed_bundle_config_hash.clone(),
-            execution_identity_sha256: self
-                .execution_identity_consistent
+            execution_identity_sha256: complete_execution_evidence
                 .then(|| self.execution_identity_sha256.clone())
                 .flatten(),
-            execution_binding_sha256: self
-                .execution_binding_consistent
+            execution_binding_sha256: complete_execution_evidence
                 .then(|| self.execution_binding_sha256.clone())
                 .flatten(),
         })
@@ -1194,6 +1200,7 @@ mod tests {
             finish_reason: if done { Some("stop".to_string()) } else { None },
             usage: if done {
                 Some(UsageBlock {
+                    images: None,
                     prompt_tokens: 5,
                     completion_tokens: 3,
                     total_tokens: 8,
@@ -1387,6 +1394,7 @@ mod tests {
             "cancelled",
             "context_exceeded",
             "empty_model_output",
+            "invalid_guard_verdict",
             "grammar_invalid",
             "invalid_request",
             "parallel_tool_calls_violated",
@@ -1616,6 +1624,7 @@ mod tests {
         collector.last_output_at = Some(first + std::time::Duration::from_millis(400));
         collector.output_event_count = 2;
         collector.final_meta.as_mut().expect("terminal").usage = Some(UsageBlock {
+            images: None,
             prompt_tokens: 1,
             completion_tokens: 4,
             total_tokens: 5,

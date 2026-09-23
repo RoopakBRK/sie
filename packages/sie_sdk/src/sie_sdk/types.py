@@ -599,6 +599,7 @@ class GenerationUsage(TypedDict):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    images: NotRequired[int]
     credits_charged: NotRequired[int]
     rate_book_version: NotRequired[str]
 
@@ -658,6 +659,12 @@ class GenerateChunk(TypedDict, total=False):
         finish_reason: Termination reason (terminal chunk only).
         usage: Prompt / completion / total token counts (terminal chunk only).
         ttft_ms: Time-to-first-token in milliseconds (terminal chunk only).
+        execution_identity_sha256: Optional worker-origin execution identity.
+            Present only on a successful terminal chunk, together with
+            ``execution_binding_sha256``; both are lowercase 64-hex SHA-256
+            digests. Absence is valid for older or self-hosted deployments.
+        execution_binding_sha256: Optional worker-origin execution binding,
+            with the same successful-terminal, complete-pair contract.
         error: ``{code, message, param?, retry_after_s?}`` when generation
             failed mid-stream. ``retry_after_s`` is meaningful only for
             ``RESOURCE_EXHAUSTED``.
@@ -671,6 +678,8 @@ class GenerateChunk(TypedDict, total=False):
     finish_reason: FinishReason
     usage: GenerationUsage
     ttft_ms: float
+    execution_identity_sha256: str
+    execution_binding_sha256: str
     error: GenerateChunkError
 
 
@@ -691,17 +700,30 @@ class ChatImageURL(TypedDict, total=False):
     url: str
 
 
+class ChatVideoURL(TypedDict):
+    """``video_url`` payload of a video content part.
+
+    A base64 ``data:video/<subtype>;base64,...`` URI of an MP4/MOV,
+    WebM/Matroska, or AVI container. Remote URLs are rejected.
+    """
+
+    url: str
+
+
 class ChatContentPart(TypedDict, total=False):
     """One part of a multimodal ``messages[*].content`` array.
 
     Text parts (``text`` / ``input_text``) carry ``text``; image parts
     (``image_url`` / ``input_image``) carry ``image_url`` as a base64 ``data:``
-    URI and are accepted for vision-capable generation models.
+    URI and are accepted for vision-capable generation models. One
+    ``video_url`` part per request is accepted for models that declare video
+    input.
     """
 
-    type: Literal["text", "input_text", "image_url", "input_image"]
+    type: Literal["text", "input_text", "image_url", "input_image", "video_url"]
     text: str
     image_url: str | ChatImageURL
+    video_url: ChatVideoURL
 
 
 class ChatMessage(TypedDict, total=False):
@@ -727,6 +749,7 @@ class ChatUsage(TypedDict):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    images: NotRequired[int]
 
 
 class ChatChoice(TypedDict, total=False):

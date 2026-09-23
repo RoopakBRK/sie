@@ -74,6 +74,11 @@ from sie_server.config.model import validate_chat_template_kwargs
 from sie_server.core.runtime_options import apply_generation_runtime_options
 from sie_server.core.text_tokens import estimate_tokens_from_chars
 from sie_server.core.tokenizer import image_first_chat_message, load_tokenizer
+from sie_server.core.video_frames import (
+    VideoDecodeError,
+    check_generation_video_bounds,
+    sniff_video_container,
+)
 from sie_server.observability import worker_telemetry as _metrics
 from sie_server.processors.grammar_cache import GrammarLRU
 from sie_server.processors.grammar_compile import compile_outlines
@@ -83,8 +88,13 @@ from sie_server.processors.tool_call_grammar import (
     normalize_tool_choice,
 )
 from sie_server.processors.tool_call_parser import ToolCallFormat, parse_tool_call_stream
-from sie_server.types.grammar import GrammarSpec, GrammarValidationError, hash_grammar
-from sie_server.types.inputs import ImageInput
+from sie_server.types.grammar import (
+    OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,
+    GrammarSpec,
+    GrammarValidationError,
+    hash_grammar,
+)
+from sie_server.types.inputs import ImageInput, VideoInput
 
 # Module-level shim around :func:`asyncio.wait_for`. Tests monkey-patch
 # this attribute (not the global ``asyncio.wait_for``) so the override
@@ -291,6 +301,21 @@ _MAX_DECODE_IMAGE_BYTES = 16 * 1024 * 1024
 # clients send. Both are decoded from an inline ``data:`` URI.
 _IMAGE_CONTENT_PART_TYPES: frozenset[str] = frozenset({"image_url", "input_image"})
 
+# One clip per request: the engine samples frames on its request loop, and a
+# flat ``video_data`` list is only unambiguous for a single clip under n > 1.
+# Mirrored at the gateway and the sidecar.
+_MAX_VIDEOS_PER_REQUEST = 1
+
+# Upper bound on one clip's visual tokens. Video-capable profiles must bound
+# the runtime's sampling with ``--mm-process-config`` ``video.total_pixels`` of
+# at most ``_VISION_TOKENS_PER_VIDEO_ESTIMATE * 1024`` (one token per merged
+# 32x32 patch across all sampled frames); a config test enforces this.
+_VISION_TOKENS_PER_VIDEO_ESTIMATE = 8192
+
+# Mirrors the sidecar's per-item generation media budget for queue callers
+# that bypass it.
+_MAX_DECODE_VIDEO_BYTES = 16 * 1024 * 1024
+
 
 def _decode_data_uri_image(url: str) -> tuple[bytes, str | None]:
     """Decode an inline ``data:`` image URI into ``(bytes, format)``.
@@ -424,6 +449,55 @@ def _parse_message_images_field(raw: object, idx: int) -> tuple[ImageInput, ...]
     return tuple(out)
 
 
+def _parse_message_videos_field(raw: object, idx: int) -> tuple[VideoInput, ...] | _ValidationError:
+    """Parse a message-level ``videos`` field of gateway-forwarded clips.
+
+    Same transport contract as ``images`` (msgpack binary from the sidecar, or
+    a legacy base64 string). The container is re-identified from its bytes for
+    queue-bypass callers, and becomes the format hint the engine decodes with.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        return _ValidationError(code="invalid_request", message=f"messages[{idx}].videos must be an array")
+    out: list[VideoInput] = []
+    for i, entry in enumerate(raw):
+        path = f"messages[{idx}].videos[{i}]"
+        if not isinstance(entry, dict):
+            return _ValidationError(code="invalid_request", message=f"{path} must be an object")
+        raw_data = cast("dict[str, Any]", entry).get("data")
+        if isinstance(raw_data, bytes):
+            data = raw_data
+        elif isinstance(raw_data, str) and raw_data:
+            if (len(raw_data) * 3) // 4 > _MAX_DECODE_VIDEO_BYTES:
+                return _ValidationError(
+                    code="invalid_request", message=f"{path}: video too large; exceeds {_MAX_DECODE_VIDEO_BYTES} bytes"
+                )
+            try:
+                data = base64.b64decode(raw_data, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                return _ValidationError(code="invalid_request", message=f"{path}: invalid base64 video data: {exc}")
+        else:
+            return _ValidationError(
+                code="invalid_request", message=f"{path}.data must be non-empty bytes or a base64 string"
+            )
+        if not data:
+            return _ValidationError(code="invalid_request", message=f"{path}: video data is empty")
+        if len(data) > _MAX_DECODE_VIDEO_BYTES:
+            return _ValidationError(
+                code="invalid_request",
+                message=f"{path}: video too large ({len(data)} bytes); exceeds {_MAX_DECODE_VIDEO_BYTES} bytes",
+            )
+        container = sniff_video_container(data)
+        if container is None:
+            return _ValidationError(
+                code="invalid_request",
+                message=f"{path}: video data must be an MP4/MOV, WebM/Matroska, or AVI container",
+            )
+        out.append({"data": data, "format": container})
+    return tuple(out)
+
+
 def _parse_content_parts_field(raw: object, idx: int) -> tuple[dict[str, Any], ...] | None | _ValidationError:
     """Parse a message-level ``content_parts`` field of gateway-forwarded layout.
 
@@ -458,10 +532,12 @@ def _parse_content_parts_field(raw: object, idx: int) -> tuple[dict[str, Any], .
             out.append({"type": "text", "text": text})
         elif ptype == "image":
             out.append({"type": "image"})
+        elif ptype == "video":
+            out.append({"type": "video"})
         else:
             return _ValidationError(
                 code="invalid_request",
-                message=f"messages[{idx}].content_parts[{i}].type must be 'text' or 'image', got {ptype!r}",
+                message=f"messages[{idx}].content_parts[{i}].type must be 'text', 'image', or 'video', got {ptype!r}",
             )
     return tuple(out)
 
@@ -577,6 +653,9 @@ class _ChatMessage:
     # rendering from ``content`` + ``images``. Image markers here line up 1:1
     # with ``images`` (same order); only placeholder POSITIONS differ.
     content_parts: tuple[dict[str, Any], ...] | None = None
+    # Video input (gateway ``videos`` field). Always paired with
+    # ``content_parts`` carrying one ``{"type":"video"}`` marker per clip.
+    videos: tuple[VideoInput, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -708,6 +787,7 @@ def _adapter_generate_parameters(
     params: _GenerateRequestParams,
     grammar: GrammarSpec | None,
     images: list[ImageInput] | None,
+    videos: list[VideoInput] | None = None,
 ) -> dict[str, Any]:
     """Build the exact adapter keyword mapping used for preflight and dispatch."""
     values: dict[str, Any] = {
@@ -746,6 +826,8 @@ def _adapter_generate_parameters(
         values["lora_path"] = params.lora_adapter
     if images:
         values["images"] = images
+    if videos:
+        values["videos"] = videos
     return values
 
 
@@ -1145,10 +1227,11 @@ class StreamingProcessor:
         Drives format selection from a single source of truth — the
         adapter's ``tool_call_parser`` (the same value passed to SGLang's
         ``--tool-call-parser`` launch flag) — instead of guessing per
-        block from the model output. ``qwen3_coder`` (and any other
-        ``qwen*`` parser) → ``qwen_xml``; ``hermes`` → ``hermes_json``;
-        anything unknown / missing → ``auto`` (keep the runtime
-        heuristic so out-of-tree models still work).
+        block from the model output. ``qwen25`` (Qwen2.5-style Hermes JSON)
+        and ``hermes`` → ``hermes_json``; ``qwen3_coder`` (and any other
+        ``qwen*`` parser) → ``qwen_xml``; ``glm*`` → ``glm_xml``; anything
+        unknown / missing → ``auto`` (keep the runtime heuristic so
+        out-of-tree models still work).
         """
         try:
             config = self._registry.get_config(model_id)
@@ -1162,10 +1245,12 @@ class StreamingProcessor:
         if not isinstance(parser, str):
             return "auto"
         parser_l = parser.lower()
+        if parser_l == "qwen25" or "hermes" in parser_l:
+            return "hermes_json"
         if parser_l.startswith("qwen"):
             return "qwen_xml"
-        if "hermes" in parser_l:
-            return "hermes_json"
+        if parser_l.startswith("glm"):
+            return "glm_xml"
         return "auto"
 
     @staticmethod
@@ -1703,9 +1788,24 @@ class StreamingProcessor:
         # placeholders the chat template renders. ``None`` for the prompt
         # shape and for text-only message lists.
         request_images: list[ImageInput] | None = None
+        request_videos: list[VideoInput] | None = None
         if isinstance(params.input, _MessagesInput):
             collected = [img for m in params.input.messages for img in (m.images or ())]
             request_images = collected or None
+            request_videos = [video for m in params.input.messages for video in (m.videos or ())] or None
+            if request_videos:
+                video_error = await self._check_request_videos(model_id, request_videos)
+                if video_error is not None:
+                    await self._terminal_error_then_settle(
+                        reply_subject,
+                        request_id=request_id,
+                        attempt_id=attempt_id,
+                        seq=0,
+                        code=video_error.code,
+                        message=video_error.message,
+                        msg=msg,
+                    )
+                    return
             # Worker-side vision capability gate (defense-in-depth for the
             # queue-bypass path). Run it BEFORE chat-template rendering so a
             # text-only model handed images fails fast with a clear error
@@ -1773,6 +1873,7 @@ class StreamingProcessor:
             params.max_new_tokens,
             adapter=adapter,
             num_images=len(request_images) if request_images else 0,
+            num_videos=len(request_videos) if request_videos else 0,
         )
         if ctx_error is not None:
             await self._terminal_error_then_settle(
@@ -1867,6 +1968,7 @@ class StreamingProcessor:
             params=params,
             grammar=effective_grammar,
             images=request_images,
+            videos=request_videos,
         )
         try:
             preflight_result = adapter.preflight_generate(generation_parameters, stream=params.stream)
@@ -1916,6 +2018,7 @@ class StreamingProcessor:
         # reserve KV budget proportional to their real (placeholder-expanded)
         # footprint instead of just the short placeholder text.
         image_reserve = (len(request_images) if request_images else 0) * _VISION_TOKENS_PER_IMAGE_ESTIMATE
+        image_reserve += (len(request_videos) if request_videos else 0) * _VISION_TOKENS_PER_VIDEO_ESTIMATE
         reserve_tokens = estimate_tokens_from_chars(prompt_str) + params.max_new_tokens + image_reserve
         effective_budget = budget_override if budget_override is not None else self._kv_budget_tokens
         admitted = await self._try_reserve(
@@ -2031,6 +2134,8 @@ class StreamingProcessor:
         # Dispatch a copy of that mapping so admission and execution cannot
         # drift through a second set of keyword-construction rules.
         gen_kwargs = dict(generation_parameters)
+        images = gen_kwargs.get("images")
+        image_count = len(images) if images else None
         # Worker-side phase boundary (#3136): everything between work receipt
         # and this adapter dispatch — deserialization, validation, model load,
         # chat-template render, context checks, and KV-admission wait — is the
@@ -2093,6 +2198,7 @@ class StreamingProcessor:
         first_text_at: float | None = None
         publish_at = time.monotonic()
         first_yield_done = False
+        first_text_published = False
         terminal_sent = False
         # H6: separate flag for "the terminal we published was
         # ``transport_failure``" — even when the terminal lands on the
@@ -2113,7 +2219,7 @@ class StreamingProcessor:
                 publish_failures.pop(0)
             return len(publish_failures) >= _PUBLISH_FAIL_THRESHOLD
 
-        async def _flush_pending() -> bool:
+        async def _flush_pending(*, progress: bool = False) -> bool:
             """Enqueue any pending coalesced text. Returns False on overflow.
 
             Uses a bounded await (``_CHUNK_PUT_TIMEOUT_S``) so a brief
@@ -2124,17 +2230,18 @@ class StreamingProcessor:
             a gap in the wire sequence (the gateway rejects gaps as a
             stream error).
             """
-            nonlocal seq, pending_count, last_flush_ts
-            if not pending_text:
+            nonlocal seq, pending_count, last_flush_ts, first_text_published
+            if not pending_text and not progress:
                 return True
+            text = "".join(pending_text)
             payload = _encode_chunk(
                 kind="chunk",
                 request_id=request_id,
                 attempt_id=attempt_id,
                 seq=seq,
-                text_delta="".join(pending_text),
+                text_delta=text,
                 done=False,
-                is_first=(seq == 0),
+                is_first=bool(text) and not first_text_published,
                 logprobs=pending_logprobs or None,
             )
             try:
@@ -2142,6 +2249,7 @@ class StreamingProcessor:
             except (asyncio.QueueFull, TimeoutError):
                 return False
             seq += 1
+            first_text_published = first_text_published or bool(text)
             pending_text.clear()
             pending_logprobs.clear()
             pending_count = 0
@@ -2384,6 +2492,7 @@ class StreamingProcessor:
                         finish_reason=chunk.finish_reason or "stop",
                         prompt_tokens=chunk.prompt_tokens,
                         completion_tokens=chunk.completion_tokens,
+                        images=image_count if not terminal_has_error and chunk.finish_reason != "cancelled" else None,
                         ttft_ms=_compute_ttft_ms(publish_at, first_text_at),
                         error_code=(chunk.error_code or "inference_error") if terminal_has_error else None,
                         error_message=(
@@ -2452,8 +2561,8 @@ class StreamingProcessor:
                     pending_logprobs.extend(chunk.logprobs)
 
                 now = time.monotonic()
-                if pending_count >= _FLUSH_MAX_TOKENS or (pending_text and (now - last_flush_ts) >= _FLUSH_INTERVAL_S):
-                    ok = await _flush_pending()
+                if pending_count >= _FLUSH_MAX_TOKENS or seq == 0 or (now - last_flush_ts) >= _FLUSH_INTERVAL_S:
+                    ok = await _flush_pending(progress=True)
                     if not ok:
                         # Flush failed after a bounded await on a non-terminal
                         # chunk — content was dropped. Publish
@@ -2789,6 +2898,7 @@ class StreamingProcessor:
                 )
             decoded: list[_ChatMessage] = []
             total_images = 0
+            total_videos = 0
             for idx, item in enumerate(messages_raw):
                 if not isinstance(item, dict):
                     return _ValidationError(
@@ -2847,7 +2957,18 @@ class StreamingProcessor:
                 # also keeps an empty tuple off the interleaved render path, so the
                 # render guard (``if m.content_parts``) and the reconcile guard
                 # below agree.
-                field_has_image = field_parts is not None and any(p.get("type") == "image" for p in field_parts)
+                field_videos = _parse_message_videos_field(item_dict.get("videos"), idx)
+                if isinstance(field_videos, _ValidationError):
+                    return field_videos
+                total_videos += len(field_videos)
+                if total_videos > _MAX_VIDEOS_PER_REQUEST:
+                    return _ValidationError(
+                        code="invalid_request",
+                        message=f"too many videos ({total_videos}); maximum is {_MAX_VIDEOS_PER_REQUEST} per request",
+                    )
+                field_has_image = field_parts is not None and any(
+                    p.get("type") in ("image", "video") for p in field_parts
+                )
                 normalized_field_parts = field_parts if field_has_image else None
                 # Exactly one image-bearing layout source is allowed. An image-bearing
                 # ``content_parts`` field alongside an image-bearing ``content`` array
@@ -2867,6 +2988,15 @@ class StreamingProcessor:
                 # Reconcile placeholder count with the flat image list — a
                 # mismatch would desync placeholders from ``image_data`` at the
                 # engine, so reject it here rather than mis-render downstream.
+                video_markers = sum(1 for p in message_content_parts or () if p.get("type") == "video")
+                if video_markers != len(field_videos):
+                    return _ValidationError(
+                        code="invalid_request",
+                        message=(
+                            f"messages[{idx}].content_parts has {video_markers} video placeholder(s) "
+                            f"but {len(field_videos)} video(s) were provided"
+                        ),
+                    )
                 if message_content_parts is not None:
                     image_markers = sum(1 for p in message_content_parts if p.get("type") == "image")
                     if image_markers != len(message_images):
@@ -2885,6 +3015,7 @@ class StreamingProcessor:
                         tool_call_id=tool_call_id if isinstance(tool_call_id, str) else None,
                         images=message_images or None,
                         content_parts=message_content_parts,
+                        videos=field_videos or None,
                     )
                 )
             input_value = _MessagesInput(messages=tuple(decoded))
@@ -3412,6 +3543,28 @@ class StreamingProcessor:
             )
         return rendered
 
+    async def _check_request_videos(self, model_id: str, videos: list[VideoInput]) -> _ValidationError | None:
+        """Gate video on ``inputs.video`` and bound the runtime's decode work.
+
+        The runtime decodes video on its request loop, so container metadata
+        (decodable, duration cap, frame size) is checked here, off this loop,
+        before the request is admitted.
+        """
+        try:
+            config = self._registry.get_config(model_id)
+        except KeyError:
+            config = None
+        if config is not None and not config.inputs.video:
+            return _ValidationError(code="invalid_request", message=f"model '{model_id}' does not support video input")
+        for index, video in enumerate(videos):
+            try:
+                await asyncio.to_thread(
+                    check_generation_video_bounds, video["data"], suffix=f".{video.get('format') or 'mp4'}"
+                )
+            except VideoDecodeError as exc:
+                return _ValidationError(code="invalid_request", message=f"videos[{index}]: {exc}")
+        return None
+
     async def _check_context_length(
         self,
         model_id: str,
@@ -3420,6 +3573,7 @@ class StreamingProcessor:
         *,
         adapter: GenerationAdapter,
         num_images: int = 0,
+        num_videos: int = 0,
     ) -> _ValidationError | None:
         """Worker-side context-length guard.
 
@@ -3498,7 +3652,7 @@ class StreamingProcessor:
         # in ``prompt`` tokenizes to a handful of text tokens but expands to
         # many tokens at inference. Add a coarse per-image estimate so the
         # guard fires before SGLang overflows its context window.
-        image_tokens = num_images * _VISION_TOKENS_PER_IMAGE_ESTIMATE
+        image_tokens = num_images * _VISION_TOKENS_PER_IMAGE_ESTIMATE + num_videos * _VISION_TOKENS_PER_VIDEO_ESTIMATE
         input_tokens = prompt_tokens + image_tokens
         image_note = f" + ~image_tokens ({image_tokens})" if image_tokens else ""
         if adapter.context_length_accounting == "independent":
@@ -3625,8 +3779,8 @@ class StreamingProcessor:
                 # load, so a generous ceiling here still guarantees the
                 # follower settles its own work item rather than hanging
                 # until ack_wait and triggering redelivery.
-                await _wait_for(future_to_await, timeout=_GRAMMAR_FOLLOWER_TIMEOUT_S)
-            except Exception:  # noqa: BLE001
+                await _wait_for(asyncio.shield(future_to_await), timeout=_GRAMMAR_FOLLOWER_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001
                 # Leader's compile failed, was cancelled, or did not
                 # resolve in time; surface the same terminal-error path.
                 logger.warning(
@@ -3635,13 +3789,22 @@ class StreamingProcessor:
                     attempt_id,
                     exc_info=True,
                 )
+                known_type_refusal = (
+                    grammar.kind == "json_schema"
+                    and isinstance(exc, GrammarValidationError)
+                    and exc.code == "invalid_request"
+                    and exc.args == (OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,)
+                )
                 await self._terminal_error_then_settle(
                     reply_subject,
                     request_id=request_id,
                     attempt_id=attempt_id,
                     seq=0,
-                    code="grammar_compile_failed",
-                    message=_INTERNAL_GRAMMAR_COMPILE_MESSAGE,
+                    code="invalid_request" if known_type_refusal else "grammar_compile_failed",
+                    message=OUTLINES_JSON_SCHEMA_TYPE_MESSAGE
+                    if known_type_refusal
+                    else _INTERNAL_GRAMMAR_COMPILE_MESSAGE,
+                    param="grammar" if known_type_refusal else None,
                     msg=msg,
                 )
                 return False
@@ -3784,6 +3947,11 @@ class StreamingProcessor:
                 seq=0,
                 code=exc.code,
                 message=str(exc),
+                param="grammar"
+                if grammar.kind == "json_schema"
+                and exc.code == "invalid_request"
+                and exc.args == (OUTLINES_JSON_SCHEMA_TYPE_MESSAGE,)
+                else None,
                 msg=msg,
             )
             return False
@@ -4067,6 +4235,7 @@ def _encode_chunk(
     finish_reason: FinishReason | None = None,
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
+    images: int | None = None,
     ttft_ms: float | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
@@ -4105,6 +4274,8 @@ def _encode_chunk(
             "completion_tokens": int(completion_tokens or 0),
             "total_tokens": int((prompt_tokens or 0) + (completion_tokens or 0)),
         }
+        if images is not None:
+            payload["usage"]["images"] = images
     if ttft_ms is not None:
         payload["ttft_ms"] = ttft_ms
     if error_code is not None or error_message is not None:

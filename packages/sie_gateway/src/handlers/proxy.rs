@@ -88,8 +88,9 @@ pub fn native_request_body_limit(endpoint: &str) -> usize {
 ///
 /// Public for the same reason as [`native_request_body_limit`], and separate
 /// from it because the compat generation routes do NOT take the 24 MiB native
-/// `generate` cap: their bodies carry no inline native media array, so they sit
-/// on the shared [`MAX_JSON_BODY_BYTES`] bound. An estimate that bounded a chat
+/// `generate` cap: inline chat media (base64 `image_url` / `video_url` data URIs)
+/// rides inside this shared [`MAX_JSON_BODY_BYTES`] bound, which is therefore
+/// also the effective per-request media ceiling. An estimate that bounded a chat
 /// body at the native number would accept 1.5x what the route it prices
 /// accepts — the exact way around the rail this helper exists to prevent
 /// (#2435).
@@ -4449,7 +4450,7 @@ async fn queue_mode_streaming_generate(
         HeaderName::from_static("x-sie-server-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    insert_stream_model_revision_header(
+    insert_buffered_generation_model_revision_header(
         response.headers_mut(),
         model_revision,
         bundle_config_hash,
@@ -4713,6 +4714,55 @@ fn decode_image_data_uri(value: &serde_json::Value) -> Result<(String, Option<St
     Ok((payload.to_string(), format))
 }
 
+/// Extract an inline OpenAI ``video_url`` value into ``(base64, container)``.
+///
+/// Stricter than images because the engine decodes video with FFmpeg, which
+/// picks its demuxer by content: only the ``{"url": "data:video/<subtype>;base64,..."}``
+/// object shape with no other keys, no whitespace in the payload, and a
+/// container identified by its magic bytes (MP4/MOV, WebM/Matroska, AVI) —
+/// never by the declared media type, so a playlist or concat script labelled
+/// ``video/mp4`` is refused. Remote URLs are never fetched.
+fn decode_video_data_uri(value: &serde_json::Value) -> Result<(String, String), String> {
+    use base64::Engine as _;
+
+    let url = match value {
+        serde_json::Value::Object(o) if o.len() == 1 => o
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "video_url must be an object with only a non-empty 'url'".to_string())?,
+        _ => return Err("video_url must be an object with only a non-empty 'url'".to_string()),
+    };
+    let rest = url.strip_prefix("data:").ok_or_else(|| {
+        "video content must be an inline base64 'data:' URI; remote URL fetching is not supported".to_string()
+    })?;
+    let (header, payload) = rest
+        .split_once(',')
+        .ok_or_else(|| "malformed video data URI (missing ',')".to_string())?;
+    let mut params = header.split(';');
+    let mime = params.next().unwrap_or("");
+    match mime.split_once('/') {
+        Some(("video", subtype)) if !subtype.is_empty() => {}
+        _ => return Err("video data URI must have a video/<subtype> media type".to_string()),
+    }
+    if !params.any(|p| p == "base64") {
+        return Err("video data URI must be base64-encoded".to_string());
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| format!("invalid base64 video data: {e}"))?;
+    let container = if decoded.get(4..8) == Some(b"ftyp") {
+        "mp4"
+    } else if decoded.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        "mkv"
+    } else if decoded.starts_with(b"RIFF") && decoded.get(8..12) == Some(b"AVI ") {
+        "avi"
+    } else {
+        return Err("video data must be an MP4/MOV, WebM/Matroska, or AVI container".to_string());
+    };
+    Ok((payload.to_string(), container.to_string()))
+}
+
 /// Validate an OpenAI ``/v1/chat/completions`` request body against
 /// the chat-completions supported subset.
 ///
@@ -4822,6 +4872,11 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
     // worker. Mirrors the worker's ``_MAX_IMAGES_PER_REQUEST``.
     const MAX_IMAGES_PER_REQUEST: usize = 16;
     let mut total_images: usize = 0;
+    // The engine samples each video's frames on its request loop and a flat
+    // ``video_data`` list is only unambiguous for one clip under ``n > 1``.
+    // Mirrors the worker's ``_MAX_VIDEOS_PER_REQUEST``.
+    const MAX_VIDEOS_PER_REQUEST: usize = 1;
+    let mut total_videos: usize = 0;
     // ``tool`` is allowed so the multi-turn tool-use loop works: the
     // caller replays the assistant's tool_call request and the tool
     // result back into ``messages`` for the model's final answer.
@@ -5015,6 +5070,7 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
         // resolution (mirrors the grammar/tools capability gates) — parsing
         // here is capability-agnostic because the model isn't resolved yet.
         let mut message_images: Vec<publisher::ChatImage> = Vec::new();
+        let mut message_videos: Vec<publisher::ChatVideo> = Vec::new();
         // Ordered text↔image layout, preserving the parts' original order so
         // the worker can interleave placeholders (vs. images-first). Only the
         // placeholder positions depend on this; bytes still ride
@@ -5114,6 +5170,43 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
                                 }
                             }
                         }
+                        "video_url" => {
+                            let Some(video_url) = part_obj.get("video_url") else {
+                                return bad(
+                                    &format!(
+                                        "messages[{idx}].content[{pi}].video_url is required for video content parts"
+                                    ),
+                                    Some(&format!("messages[{idx}].content[{pi}].video_url")),
+                                    oai_code::INVALID_REQUEST,
+                                );
+                            };
+                            total_videos += 1;
+                            if total_videos > MAX_VIDEOS_PER_REQUEST {
+                                return bad(
+                                    &format!(
+                                        "too many videos ({total_videos}); maximum is {MAX_VIDEOS_PER_REQUEST} per request"
+                                    ),
+                                    Some(&format!("messages[{idx}].content[{pi}].video_url")),
+                                    oai_code::INVALID_REQUEST,
+                                );
+                            }
+                            match decode_video_data_uri(video_url) {
+                                Ok((data, format)) => {
+                                    message_videos.push(publisher::ChatVideo {
+                                        data,
+                                        format: Some(format),
+                                    });
+                                    content_parts.push(publisher::ContentPart::Video);
+                                }
+                                Err(reason) => {
+                                    return bad(
+                                        &format!("messages[{idx}].content[{pi}]: {reason}"),
+                                        Some(&format!("messages[{idx}].content[{pi}].video_url")),
+                                        oai_code::INVALID_REQUEST,
+                                    );
+                                }
+                            }
+                        }
                         other => {
                             return bad(
                                 &format!(
@@ -5141,6 +5234,7 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
             }
         };
         let has_images = !message_images.is_empty();
+        let has_videos = !message_videos.is_empty();
         messages.push(publisher::ChatMessage {
             role,
             content,
@@ -5154,8 +5248,13 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
             // Forward the ordered layout only for multimodal messages — a
             // text-only message keeps ``content_parts: None`` and renders from
             // ``content`` as before (no wire bloat, no behavior change).
-            content_parts: if has_images {
+            content_parts: if has_images || has_videos {
                 Some(content_parts)
+            } else {
+                None
+            },
+            videos: if has_videos {
+                Some(message_videos)
             } else {
                 None
             },
@@ -6363,11 +6462,7 @@ fn build_chat_completion_body(
         // backend-config identifier (see `system_fingerprint`). Present and
         // identical in shape on both the blocking and streaming responses.
         "system_fingerprint": system_fingerprint(model),
-        "usage": {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        }
+        "usage": usage
     });
     Ok(serde_json::to_vec(&body).unwrap_or_default())
 }
@@ -7143,6 +7238,22 @@ async fn proxy_chat_inner(
                     .into_response();
             }
         }
+        let has_videos = params
+            .messages
+            .iter()
+            .any(|m| m.videos.as_ref().is_some_and(|videos| !videos.is_empty()));
+        if has_videos && !info.info_extras.supports_video_generation() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_openai_error(
+                    format!("Model '{model_name}' does not support video input"),
+                    oai_type::INVALID_REQUEST,
+                    Some("messages"),
+                    oai_code::UNSUPPORTED_FIELD,
+                )),
+            )
+                .into_response();
+        }
     } else if params.grammar.is_some() {
         // No model info means we cannot determine grammar capabilities;
         // safer to reject than to publish work the model cannot honour.
@@ -7181,6 +7292,21 @@ async fn proxy_chat_inner(
             StatusCode::BAD_REQUEST,
             Json(json_openai_error(
                 format!("Model '{model_name}' does not support image input (no model info)"),
+                oai_type::INVALID_REQUEST,
+                Some("messages"),
+                oai_code::UNSUPPORTED_FIELD,
+            )),
+        )
+            .into_response();
+    } else if params
+        .messages
+        .iter()
+        .any(|m| m.videos.as_ref().is_some_and(|videos| !videos.is_empty()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_openai_error(
+                format!("Model '{model_name}' does not support video input (no model info)"),
                 oai_type::INVALID_REQUEST,
                 Some("messages"),
                 oai_code::UNSUPPORTED_FIELD,
@@ -7323,7 +7449,7 @@ async fn proxy_chat_inner(
         HeaderName::from_static("x-sie-server-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    insert_stream_model_revision_header(
+    insert_buffered_generation_model_revision_header(
         response.headers_mut(),
         model_revision.as_deref(),
         &bundle_config_hash,
@@ -7760,11 +7886,7 @@ fn build_text_completion_body(
             "finish_reason": map_chat_finish_reason(&outcome.finish_reason),
         }],
         "system_fingerprint": system_fingerprint(model),
-        "usage": {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        }
+        "usage": usage
     });
     Ok(serde_json::to_vec(&body).unwrap_or_default())
 }
@@ -7969,7 +8091,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         HeaderName::from_static("x-sie-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    insert_stream_model_revision_header(
+    insert_buffered_generation_model_revision_header(
         h,
         model_revision.as_deref(),
         &bundle_config_hash,
@@ -8246,6 +8368,7 @@ fn responses_params_from_json(body: &serde_json::Value) -> ResponsesParamsResult
                     // via /v1/chat/completions (the cut-your-bill skill surface).
                     images: None,
                     content_parts: None,
+                    videos: None,
                 });
             }
             publisher::GenerateInput::Messages { messages }
@@ -8569,7 +8692,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         HeaderName::from_static("x-sie-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    insert_stream_model_revision_header(
+    insert_buffered_generation_model_revision_header(
         h,
         model_revision.as_deref(),
         &bundle_config_hash,
@@ -9368,7 +9491,7 @@ fn insert_model_revision_header(
     }
 }
 
-fn insert_stream_model_revision_header(
+fn insert_buffered_generation_model_revision_header(
     headers: &mut HeaderMap,
     model_revision: Option<&str>,
     expected_bundle_config_hash: &str,
@@ -9778,13 +9901,7 @@ pub(crate) fn build_generate_success_body_v2(
     outcome: &crate::queue::streaming::StreamOutcome,
     use_msgpack: bool,
 ) -> Vec<u8> {
-    let usage_value = outcome.usage.as_ref().map(|u| {
-        json!({
-            "prompt_tokens": u.prompt_tokens,
-            "completion_tokens": u.completion_tokens,
-            "total_tokens": u.total_tokens,
-        })
-    });
+    let usage_value = outcome.usage.as_ref().map(|usage| json!(usage));
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), json!(model));
     body.insert("text".to_string(), json!(outcome.text));
@@ -11328,6 +11445,7 @@ fn generate_params_from_json(
                 tool_call_id: None,
                 images: Some(images),
                 content_parts: None,
+                videos: None,
             }],
         },
         None => publisher::GenerateInput::Prompt { prompt },
@@ -11746,6 +11864,7 @@ fn generate_params_from_rmpv(
                 tool_call_id: None,
                 images: Some(images),
                 content_parts: None,
+                videos: None,
             }],
         },
         None => publisher::GenerateInput::Prompt { prompt },
@@ -12098,7 +12217,9 @@ fn decode_dtype_values(dtype: &str, data: &[u8]) -> Option<Vec<serde_json::Value
                 return None;
             }
             Some(
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         serde_json::Value::from(val as f64)
@@ -12111,7 +12232,9 @@ fn decode_dtype_values(dtype: &str, data: &[u8]) -> Option<Vec<serde_json::Value
                 return None;
             }
             Some(
-                data.chunks_exact(8)
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let val = f64::from_le_bytes([
                             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
@@ -12127,7 +12250,9 @@ fn decode_dtype_values(dtype: &str, data: &[u8]) -> Option<Vec<serde_json::Value
                 return None;
             }
             Some(
-                data.chunks_exact(2)
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                         let val = f16_to_f32(bits);
@@ -12141,7 +12266,9 @@ fn decode_dtype_values(dtype: &str, data: &[u8]) -> Option<Vec<serde_json::Value
                 return None;
             }
             Some(
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let val = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         serde_json::Value::from(val as i64)
@@ -12154,7 +12281,9 @@ fn decode_dtype_values(dtype: &str, data: &[u8]) -> Option<Vec<serde_json::Value
                 return None;
             }
             Some(
-                data.chunks_exact(8)
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let val = i64::from_le_bytes([
                             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
@@ -12170,7 +12299,9 @@ fn decode_dtype_values(dtype: &str, data: &[u8]) -> Option<Vec<serde_json::Value
                 return None;
             }
             Some(
-                data.chunks_exact(2)
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let val = i16::from_le_bytes([chunk[0], chunk[1]]);
                         serde_json::Value::from(val as i64)
@@ -12183,7 +12314,9 @@ fn decode_dtype_values(dtype: &str, data: &[u8]) -> Option<Vec<serde_json::Value
                 return None;
             }
             Some(
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let val = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         serde_json::Value::from(val as u64)
@@ -12196,7 +12329,9 @@ fn decode_dtype_values(dtype: &str, data: &[u8]) -> Option<Vec<serde_json::Value
                 return None;
             }
             Some(
-                data.chunks_exact(8)
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let val = u64::from_le_bytes([
                             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
@@ -13935,7 +14070,7 @@ mod tests {
             execution_identity_sha256: None,
             execution_binding_sha256: None,
         };
-        insert_stream_model_revision_header(
+        insert_buffered_generation_model_revision_header(
             &mut headers,
             Some(revision),
             execution_hash.as_str(),
@@ -13950,7 +14085,7 @@ mod tests {
 
         headers.clear();
         stream_outcome.executed_bundle_config_hash = Some("b".repeat(64));
-        insert_stream_model_revision_header(
+        insert_buffered_generation_model_revision_header(
             &mut headers,
             Some(revision),
             execution_hash.as_str(),
@@ -13959,7 +14094,7 @@ mod tests {
         assert!(headers.get("x-sie-model-revision").is_none());
 
         stream_outcome.executed_bundle_config_hash = None;
-        insert_stream_model_revision_header(
+        insert_buffered_generation_model_revision_header(
             &mut headers,
             Some(revision),
             execution_hash.as_str(),
@@ -14056,6 +14191,58 @@ mod tests {
         outcome.execution_identity_sha256 = Some("bad".to_string());
         insert_stream_execution_identity_header(&mut headers, &outcome);
         assert!(headers.get("x-sie-execution-identity-sha256").is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_generation_preserves_terminal_images_and_validated_binding() {
+        use crate::queue::streaming::{ChunkEnvelope, StreamCollector};
+        for (identity, binding) in [
+            (Some("a".repeat(64)), Some("b".repeat(64))),
+            (Some("a".repeat(64)), None),
+            (None, Some("b".repeat(64))),
+            (Some("bad".to_string()), Some("b".repeat(64))),
+            (Some("a".repeat(64)), Some("invalid".to_string())),
+            (Some("a".repeat(64)), Some("c".repeat(64))),
+        ] {
+            let (sender, _receiver) = tokio::sync::oneshot::channel();
+            let mut collector = StreamCollector::new(sender, "test/model".into(), "default".into());
+            for seq in 0..=1 {
+                let chunk: ChunkEnvelope = serde_json::from_value(json!({
+                    "kind": "chunk", "request_id": "request-1", "attempt_id": "attempt-1",
+                    "seq": seq, "text_delta": "", "done": seq == 1,
+                    "execution_identity_sha256": if seq == 0 { identity.clone() } else { Some("a".repeat(64)) },
+                    "execution_binding_sha256": if seq == 0 { binding.clone() } else { Some("b".repeat(64)) },
+                    "finish_reason": if seq == 1 { Some("stop") } else { None },
+                    "usage": if seq == 1 { Some(json!({
+                        "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7, "images": 1
+                    })) } else { None },
+                })).unwrap();
+                collector.apply(chunk);
+            }
+            let outcome = collector.build_outcome().unwrap();
+            let mut headers = HeaderMap::new();
+            insert_stream_execution_binding_header(&mut headers, &outcome);
+            insert_stream_execution_identity_header(&mut headers, &outcome);
+            assert_eq!(
+                headers.contains_key("x-sie-execution-binding-sha256"),
+                identity.as_deref() == Some(&"a".repeat(64))
+                    && binding.as_deref() == Some(&"b".repeat(64))
+            );
+            assert_eq!(
+                headers.contains_key("x-sie-execution-identity-sha256"),
+                headers.contains_key("x-sie-execution-binding-sha256")
+            );
+            for msgpack in [false, true] {
+                let bytes = build_generate_success_body_v2("test/model", &outcome, msgpack);
+                let body: serde_json::Value = if msgpack {
+                    rmp_serde::from_slice(&bytes).unwrap()
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                assert_eq!(body["usage"]["images"], 1);
+                assert_eq!(body["usage"]["total_tokens"], 7);
+            }
+        }
     }
 
     #[test]
@@ -14568,6 +14755,7 @@ mod tests {
                 text: "ok".to_string(),
                 finish_reason: "stop".to_string(),
                 usage: Some(crate::queue::streaming::UsageBlock {
+                    images: None,
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
@@ -14595,10 +14783,10 @@ mod tests {
 
         async fn publish_generate_streaming_sse(
             &self,
-            _target: PublishTarget,
-            _display_model: &str,
+            target: PublishTarget,
+            display_model: &str,
             _engine: &str,
-            _bundle_config_hash: &str,
+            bundle_config_hash: &str,
             _params: &WorkParams,
             _admission_pool: &str,
         ) -> Result<
@@ -14610,7 +14798,39 @@ mod tests {
             ),
             String,
         > {
-            unreachable!("bounded target proof uses non-streaming requests")
+            self.targets
+                .lock()
+                .expect("target probe lock")
+                .push((display_model.to_string(), target));
+            let (tx, rx) = oneshot::channel();
+            let mut collector = crate::queue::streaming::StreamCollector::new(
+                tx,
+                display_model.to_string(),
+                "default".to_string(),
+            );
+            let tap = collector.install_chunk_tap();
+            let terminal = serde_json::from_value(json!({
+                "kind": "chunk", "request_id": "request-1", "attempt_id": "attempt-1",
+                "seq": 0, "text_delta": "ok", "done": true, "is_first": true,
+                "finish_reason": "stop",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "executed_bundle_config_hash": bundle_config_hash,
+                "execution_identity_sha256": "c".repeat(64),
+                "execution_binding_sha256": "d".repeat(64)
+            }))
+            .unwrap();
+            assert_eq!(
+                collector.apply(terminal),
+                crate::queue::streaming::ChunkApplied::Terminal
+            );
+            let outcome = collector.build_outcome().unwrap();
+            collector.sender.take().unwrap().send(outcome).unwrap();
+            Ok((
+                "request-1".to_string(),
+                rx,
+                tap,
+                DispatchDurability::accepted(),
+            ))
         }
 
         async fn publish_cancel(&self, _request_id: &str) {}
@@ -15031,6 +15251,78 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_generation_target(probe.take_target(), "org/h", "org/h", "h100");
         }
+    }
+
+    #[tokio::test]
+    async fn native_sse_revision_contract_distinguishes_catalog_and_execution_evidence() {
+        let (state, _) = mixed_governed_generation_state(false).await;
+        let weights_revision = "0123456789abcdef0123456789abcdef01234567";
+        state
+            .model_registry
+            .add_model_config(
+                serde_json::from_value(json!({
+                    "sie_id": "org/g",
+                    "hf_revision": weights_revision,
+                    "profiles": {"default": {
+                        "adapter_path": "sie_server.adapters.sentence_transformer:Adapter",
+                        "max_batch_tokens": 4096
+                    }}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let (execution_hash, catalog_revision, _) = state
+            .model_registry
+            .bundle_execution_evidence("default", "default", "org/g");
+        assert_eq!(catalog_revision.as_deref(), Some(weights_revision));
+        assert_eq!(execution_hash.len(), 64);
+        assert_ne!(execution_hash, weights_revision);
+        let mut worker = worker_msg("default", "l4", "default");
+        worker.bundle_config_hash = execution_hash;
+        state
+            .registry
+            .update_worker("http://worker-l4:8080", worker)
+            .await;
+
+        let response = proxy_request(
+            State(state),
+            json_request(
+                "/v1/generate/org%2Fg",
+                json!({
+                    "prompt": "hello", "max_new_tokens": 4, "stream": true
+                }),
+            ),
+            "generate",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        for header in [
+            "x-sie-model-revision",
+            "x-sie-execution-identity-sha256",
+            "x-sie-execution-binding-sha256",
+        ] {
+            assert!(!response.headers().contains_key(header));
+        }
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), 16384),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        let terminal = events.iter().find(|event| event["done"] == true).unwrap();
+        assert_eq!(terminal["execution_identity_sha256"], "c".repeat(64));
+        assert_eq!(terminal["execution_binding_sha256"], "d".repeat(64));
+        assert!(body.contains("data: [DONE]"));
+        assert!(!body.contains(weights_revision));
     }
 
     #[tokio::test]
@@ -17680,6 +17972,7 @@ mod tests {
             text: "Hello world!".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 3,
                 total_tokens: 8,
@@ -21900,6 +22193,90 @@ mod tests {
         assert_eq!(images[0].format.as_deref(), Some("png"));
     }
 
+    fn _mp4_b64() -> String {
+        use base64::Engine as _;
+        let mut bytes = vec![0u8, 0, 0, 0x18];
+        bytes.extend_from_slice(b"ftypisom");
+        bytes.extend_from_slice(&[0u8; 12]);
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn test_chat_params_accepts_video_data_uri_with_ordered_parts() {
+        let mut body = _chat_body_min("m");
+        body["messages"] = serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "video_url", "video_url": {"url": format!("data:video/mp4;base64,{}", _mp4_b64())}},
+                {"type": "text", "text": "what happens first?"},
+            ]}
+        ]);
+        let p = _expect_chat_ok(body);
+        assert_eq!(p.messages[0].content, "what happens first?");
+        assert!(p.messages[0].images.is_none());
+        let videos = p.messages[0].videos.as_ref().expect("videos populated");
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].data, _mp4_b64());
+        assert_eq!(videos[0].format.as_deref(), Some("mp4"));
+        let parts = p.messages[0]
+            .content_parts
+            .as_ref()
+            .expect("content_parts for video msg");
+        assert!(matches!(parts[0], publisher::ContentPart::Video));
+        assert!(
+            matches!(&parts[1], publisher::ContentPart::Text { text } if text == "what happens first?")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_params_rejects_invalid_video_parts() {
+        use base64::Engine as _;
+        let hls = base64::engine::general_purpose::STANDARD
+            .encode(b"#EXTM3U\n#EXTINF:1,\nhttp://169.254.169.254/a.ts\n");
+        let mp4 = _mp4_b64();
+        let cases = [
+            serde_json::json!({"url": "https://example.com/clip.mp4"}),
+            serde_json::json!(format!("data:video/mp4;base64,{mp4}")),
+            serde_json::json!({"url": format!("data:video/mp4;base64,{mp4}"), "max_dynamic_patch": 64}),
+            serde_json::json!({"url": format!("data:video/;base64,{mp4}")}),
+            serde_json::json!({"url": format!("data:image/png;base64,{mp4}")}),
+            serde_json::json!({"url": format!("data:video/mp4,{mp4}")}),
+            serde_json::json!({"url": format!("data:video/mp4;base64, {mp4}")}),
+            serde_json::json!({"url": format!("data:video/mp4;base64,{hls}")}),
+            serde_json::json!({"url": ""}),
+        ];
+        for video_url in cases {
+            let mut body = _chat_body_min("m");
+            body["messages"] = serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "x"},
+                    {"type": "video_url", "video_url": video_url.clone()},
+                ]}
+            ]);
+            let v = _expect_chat_err(body).await;
+            assert_eq!(v["error"]["code"], "invalid_request", "{video_url}");
+            assert_eq!(
+                v["error"]["param"], "messages[0].content[1].video_url",
+                "{video_url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_params_rejects_second_video() {
+        let url = format!("data:video/mp4;base64,{}", _mp4_b64());
+        let mut body = _chat_body_min("m");
+        body["messages"] = serde_json::json!([
+            {"role": "user", "content": [{"type": "video_url", "video_url": {"url": url}}]},
+            {"role": "user", "content": [{"type": "video_url", "video_url": {"url": url}}]},
+        ]);
+        let v = _expect_chat_err(body).await;
+        assert_eq!(v["error"]["param"], "messages[1].content[0].video_url");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("too many videos"));
+    }
+
     #[test]
     fn test_chat_params_preserves_interleaved_content_parts() {
         // #1294: text↔image interleaving must survive into ``content_parts`` in
@@ -22056,6 +22433,7 @@ mod tests {
             text: String::new(),
             finish_reason: "stop".to_string(),
             usage: Some(UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 9,
                 total_tokens: 14,
@@ -22111,6 +22489,7 @@ mod tests {
             text: String::new(),
             finish_reason: "tool_calls".to_string(),
             usage: Some(UsageBlock {
+                images: None,
                 prompt_tokens: 6,
                 completion_tokens: 12,
                 total_tokens: 18,
@@ -22178,6 +22557,7 @@ mod tests {
             text: String::new(),
             finish_reason: "stop".to_string(),
             usage: Some(UsageBlock {
+                images: None,
                 prompt_tokens: 3,
                 completion_tokens: 4,
                 total_tokens: 7,
@@ -22560,6 +22940,7 @@ mod tests {
             text: "a continuation".to_string(),
             finish_reason: "length".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 4,
                 completion_tokens: 16,
                 total_tokens: 20,
@@ -23183,6 +23564,7 @@ mod tests {
             text: "a joke".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
@@ -23240,6 +23622,7 @@ mod tests {
             text: "Hi there!".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 5,
                 completion_tokens: 3,
                 total_tokens: 8,
@@ -23330,6 +23713,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
@@ -23367,6 +23751,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
@@ -23399,6 +23784,7 @@ mod tests {
             text: String::new(),
             finish_reason: "tool_calls".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 7,
                 completion_tokens: 11,
                 total_tokens: 18,
@@ -23972,6 +24358,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                images: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,

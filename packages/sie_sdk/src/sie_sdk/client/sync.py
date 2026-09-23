@@ -239,6 +239,9 @@ def _parse_generate_result(
             "completion_tokens": _coerce_token_count(usage.get("completion_tokens")),
             "total_tokens": _coerce_token_count(usage.get("total_tokens")),
         }
+        images = usage.get("images")
+        if isinstance(images, int) and not isinstance(images, bool) and 0 < images <= 2**32 - 1:
+            parsed_usage["images"] = images
         settled = settled_charge_from_usage(usage)
         if settled is not None:
             parsed_usage["credits_charged"], parsed_usage["rate_book_version"] = settled
@@ -521,7 +524,12 @@ class SIEClient:
         """Return the deployed execution revision observed on the latest call in this thread.
 
         The property name is retained for wire compatibility with
-        ``X-SIE-Model-Revision``.
+        ``X-SIE-Model-Revision``. On a gateway buffered response this is the
+        lowercase 64-hex executed bundle/config SHA-256, not the catalog's
+        weights revision (for example, a 40-hex Hugging Face commit).
+        It is ``None`` when the header is absent, including gateway SSE:
+        headers precede the terminal execution evidence. Fully consuming a
+        stream does not populate this property from terminal chunk fields.
         """
         value = getattr(self._request_state, "last_model_revision", None)
         return str(value) if value is not None else None
@@ -2352,10 +2360,11 @@ class SIEClient:
                 ``"Qwen/Qwen3-4B-Instruct-2507"`` are normalized to the
                 gateway's SIE-safe path id
                 ``"Qwen__Qwen3-4B-Instruct-2507"`` for this endpoint.
-            prompt: Raw prompt string. Chat-template rendering, if any,
-                is performed by the worker — this surface has no chat-template
-                helpers in the SDK (use the OpenAI SDK against
-                ``/v1/chat/completions`` for chat-shaped requests).
+            prompt: Raw continuation input for text-only requests, passed
+                unchanged without a chat template. Served template settings
+                such as ``enable_thinking`` and ``guardian_config`` do not
+                apply to raw input. Use :meth:`chat_completions` with messages
+                for chat, instruction-based structured output, and guard checks.
             max_new_tokens: Hard cap on output tokens.
             images: Optional native image inputs. When present, the worker
                 renders one user turn containing the images and ``prompt``
@@ -3012,6 +3021,15 @@ class SIEClient:
         Yields :class:`GenerateChunk` events; the terminal chunk carries
         ``done: true`` plus ``usage`` / ``ttft_ms``. Error semantics match
         :meth:`stream_chat_completions`.
+
+        Successful terminal chunks may carry the optional complete pair
+        ``execution_identity_sha256`` / ``execution_binding_sha256``.
+        These worker-origin digests are distinct from the catalog weights
+        revision and :attr:`last_model_revision`; gateway SSE omits the
+        ``X-SIE-Model-Revision`` header.
+
+        Text-only prompts are raw continuation input, as in :meth:`generate`.
+        Use :meth:`stream_chat_completions` to apply the served chat template.
         """
         resolved_grammar = validate_generate_grammar(grammar) if grammar is not None else None
         pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)

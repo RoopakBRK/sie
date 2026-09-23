@@ -83,8 +83,9 @@ jobs:
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
         with:
           version: 2026.5.5
+          install_args: --jobs=1
         if: steps.release.outputs.prs != '' && steps.release.outputs.prs != '[]'
-      - name: Refresh coupled locks on the release pull request
+      - name: Refresh coupled locks and OpenAPI versions on the release pull request
         if: steps.release.outputs.prs != '' && steps.release.outputs.prs != '[]'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -97,14 +98,17 @@ jobs:
           git checkout -B "$branch" FETCH_HEAD
           mise exec -- uv lock --project .
           mise exec -- pnpm install --lockfile-only
+          mise exec -- pnpm --filter @superlinked/sie-sdk install --frozen-lockfile --ignore-scripts
+          mise exec -- pnpm --dir packages/sie_ts_sdk exec biome format --write package.json
           mise exec -- cargo metadata --format-version 1 > /dev/null
-          if git diff --quiet -- uv.lock pnpm-lock.yaml Cargo.lock; then
+          mise exec -- python -I tools/ci/release_openapi.py
+          if git diff --quiet -- uv.lock pnpm-lock.yaml Cargo.lock packages/sie_ts_sdk/package.json packages/sie_server/openapi.json packages/sie_gateway/openapi.json; then
             exit 0
           fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add uv.lock pnpm-lock.yaml Cargo.lock
-          git commit -m 'chore: refresh release locks'
+          git add uv.lock pnpm-lock.yaml Cargo.lock packages/sie_ts_sdk/package.json packages/sie_server/openapi.json packages/sie_gateway/openapi.json
+          git commit -m 'chore: refresh release locks and OpenAPI versions'
           git push origin "HEAD:refs/heads/$branch"
       - id: release-pr-head
         name: Verify the release PR final head after the App-authored push
@@ -176,9 +180,10 @@ jobs:
       build_only: false
 
   python-publish:
-    needs: [prepare, python]
+    needs: [prepare, artifacts-ready]
     if: >-
       needs.prepare.result == 'success' &&
+      needs.artifacts-ready.result == 'success' &&
       vars.PUBLIC_RELEASE_PUBLISHING_ENABLED == 'true' &&
       github.event_name == 'release' &&
       github.event.action == 'published' &&
@@ -225,9 +230,10 @@ jobs:
           packages-dir: pending
 
   npm-publish:
-    needs: [prepare, npm]
+    needs: [prepare, artifacts-ready]
     if: >-
       needs.prepare.result == 'success' &&
+      needs.artifacts-ready.result == 'success' &&
       vars.PUBLIC_RELEASE_PUBLISHING_ENABLED == 'true' &&
       github.event_name == 'release' &&
       github.event.action == 'published' &&
@@ -273,14 +279,79 @@ jobs:
       - name: Publish absent versions or verify identical existing bytes
         run: python3 tools/ci/distributions.py publish-npm npm --directory artifacts --version "$RELEASE_VERSION"
 
-  docker:
+  docker-build:
     needs: prepare
     if: github.event_name == 'release' && needs.prepare.result == 'success'
     permissions:
       contents: read
-      packages: write
       actions: read
     uses: ./.github/workflows/release-docker.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      tag_name: ${{ needs.prepare.outputs.tag_name }}
+      sha: ${{ needs.prepare.outputs.sha }}
+
+  helm-build:
+    needs: prepare
+    if: github.event_name == 'release' && needs.prepare.result == 'success'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-helm.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      tag_name: ${{ needs.prepare.outputs.tag_name }}
+      sha: ${{ needs.prepare.outputs.sha }}
+
+  audio-build:
+    needs: prepare
+    if: github.event_name == 'release' && needs.prepare.result == 'success'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-audio.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      tag_name: ${{ needs.prepare.outputs.tag_name }}
+      sha: ${{ needs.prepare.outputs.sha }}
+
+  native-build:
+    needs: [prepare, docker-build]
+    if: github.event_name == 'release' && needs.prepare.result == 'success'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-native.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      tag_name: ${{ needs.prepare.outputs.tag_name }}
+      sha: ${{ needs.prepare.outputs.sha }}
+
+  artifacts-ready:
+    needs: [prepare, python, npm, docker-build, helm-build, audio-build, native-build]
+    if: always() && github.event_name == 'release' && needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every tested artifact family before any publication
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYCODE'
+          import json, os
+          results = json.loads(os.environ["RESULTS"])
+          failed = {name: job["result"] for name, job in results.items() if job["result"] != "success"}
+          if failed:
+              raise SystemExit(f"Release artifacts are not ready: {failed}")
+          PYCODE
+
+  docker:
+    needs: [prepare, artifacts-ready]
+    if: >-
+      github.event_name == 'release' && needs.prepare.result == 'success' &&
+      needs.artifacts-ready.result == 'success'
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    uses: ./.github/workflows/publish-docker.yml
     with:
       version: ${{ needs.prepare.outputs.version }}
       tag_name: ${{ needs.prepare.outputs.tag_name }}
@@ -288,12 +359,14 @@ jobs:
       publish: true
 
   helm:
-    needs: [prepare, docker]
-    if: github.event_name == 'release' && needs.prepare.result == 'success'
+    needs: [prepare, artifacts-ready, docker]
+    if: >-
+      github.event_name == 'release' && needs.prepare.result == 'success' &&
+      needs.artifacts-ready.result == 'success'
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/release-helm.yml
+    uses: ./.github/workflows/publish-helm.yml
     with:
       version: ${{ needs.prepare.outputs.version }}
       tag_name: ${{ needs.prepare.outputs.tag_name }}
@@ -301,11 +374,13 @@ jobs:
       publish: true
 
   audio:
-    needs: prepare
-    if: github.event_name == 'release' && needs.prepare.result == 'success'
+    needs: [prepare, artifacts-ready]
+    if: >-
+      github.event_name == 'release' && needs.prepare.result == 'success' &&
+      needs.artifacts-ready.result == 'success'
     permissions:
       contents: write
-    uses: ./.github/workflows/release-audio.yml
+    uses: ./.github/workflows/publish-audio.yml
     with:
       version: ${{ needs.prepare.outputs.version }}
       tag_name: ${{ needs.prepare.outputs.tag_name }}
@@ -313,11 +388,13 @@ jobs:
       publish: true
 
   native:
-    needs: [prepare, docker]
-    if: github.event_name == 'release' && needs.prepare.result == 'success'
+    needs: [prepare, artifacts-ready, docker]
+    if: >-
+      github.event_name == 'release' && needs.prepare.result == 'success' &&
+      needs.artifacts-ready.result == 'success'
     permissions:
       contents: write
-    uses: ./.github/workflows/release-native.yml
+    uses: ./.github/workflows/publish-native.yml
     with:
       version: ${{ needs.prepare.outputs.version }}
       tag_name: ${{ needs.prepare.outputs.tag_name }}
@@ -325,7 +402,7 @@ jobs:
       publish: true
 
   complete:
-    needs: [prepare, python-publish, npm-publish, docker, helm, audio, native]
+    needs: [prepare, artifacts-ready, python-publish, npm-publish, docker, helm, audio, native]
     if: >-
       always() && github.event_name == 'release' &&
       github.event.action == 'published' &&

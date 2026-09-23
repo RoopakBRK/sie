@@ -67,6 +67,21 @@ console.log(scored.scores[0].itemId, scored.scores[0].score);
 
 ## Generation
 
+Text-only `generate` and `streamGenerate` prompts are raw continuation input:
+the worker preserves them without rendering a chat template or applying
+`enable_thinking` / `guardian_config`. Native requests with images render one
+user turn. For chat, instruction-based structured output (`responseFormat`),
+and guard checks, use `chatCompletions` or `streamChatCompletions` with messages
+so the worker applies the served template settings. Operator settings take
+precedence over request template kwargs.
+
+Granite Guardian's shipped risk dimension is `harm`; requesting another
+dimension in prompt text does not change it. Valid thresholded verdicts are
+`Yes` (unsafe) and `No` (safe); missing or invalid verdicts fail with
+`invalid_guard_verdict`. Never interpret an error or empty output as safe.
+Reasoning remains private; a budget exhausted without usable output fails with
+`empty_model_output`.
+
 ```typescript
 // Aggregated result
 const gen = await client.generate(

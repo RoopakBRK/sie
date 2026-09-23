@@ -44,11 +44,12 @@ from sie_server.adapters._generation_base import (
     FinishReason,
     GenerationAdapter,
     GenerationChunk,
+    GenerationUnsupportedFieldError,
 )
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED
 from sie_server.adapters.mlx import _server
-from sie_server.types.inputs import ImageInput
+from sie_server.types.inputs import ImageInput, VideoInput
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +384,7 @@ class MLXGenerationAdapter(GenerationAdapter):
         logprobs: bool = False,
         top_logprobs: int | None = None,
         images: list[ImageInput] | None = None,
+        videos: list[VideoInput] | None = None,
         **kwargs: Any,  # tolerate SGLang-only kwargs (grammar, n, best_of, stream, …)
     ) -> AsyncIterator[GenerationChunk]:
         self._check_loaded()
@@ -391,6 +393,8 @@ class MLXGenerationAdapter(GenerationAdapter):
         # rather than silently dropping the images and returning a wrong answer.
         if images:
             raise ValueError("vision input is not supported on the Mac MLX generation path yet (see plan §9)")
+        if videos:
+            raise GenerationUnsupportedFieldError("videos")
         # Unused on the MLX path today (kept to satisfy the streaming contract):
         # mlx_lm.server's /v1/completions does not expose these knobs uniformly.
         if min_new_tokens is not None:

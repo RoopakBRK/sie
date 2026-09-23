@@ -27,7 +27,7 @@ from typing import Any, ClassVar, Literal, cast
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
 from sie_server.types.grammar import GrammarSpec
-from sie_server.types.inputs import ImageInput
+from sie_server.types.inputs import ImageInput, VideoInput
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,7 @@ class GenerationDrainingError(GenerationCapacityError):
 _CLIENT_SAFE_GENERATION_ERROR_MESSAGES = {
     "inference_error": "internal error during generation",
     "grammar_compile_failed": "internal error compiling grammar",
+    "invalid_guard_verdict": "guard model did not produce a valid thresholded verdict",
 }
 _CLIENT_SAFE_GENERATION_ERROR_CODES = frozenset(
     {
@@ -122,6 +123,7 @@ _CLIENT_SAFE_GENERATION_ERROR_CODES = frozenset(
         "empty_model_output",
         "grammar_invalid",
         "invalid_request",
+        "invalid_guard_verdict",
         "parallel_tool_calls_violated",
         "rate_limit_exceeded",
         "tool_call_parse_error",
@@ -165,6 +167,7 @@ _CLIENT_SAFE_GENERATION_PARAMS = frozenset(
         "logprobs",
         "top_logprobs",
         "images",
+        "videos",
         "stream",
     }
 )
@@ -716,24 +719,10 @@ async def suppress_thinking_blocks(
                 reason = " (private reasoning consumed the generation budget)" if hid_reasoning else ""
                 rewritten = replace(
                     rewritten,
+                    finish_reason="error",
                     error_code="empty_model_output",
                     error_message=f"model produced no visible output text{reason}",
                 )
-
-            # Reasoning-only engine deltas have no wire-visible information.
-            # Keep terminals, per-choice finish markers, tool/error chunks, and
-            # non-streaming candidate aggregates intact.
-            if (
-                not rewritten.text_delta
-                and not rewritten.done
-                and rewritten.finish_reason is None
-                and rewritten.tool_call_delta is None
-                and rewritten.error_code is None
-                and rewritten.error_message is None
-                and rewritten.logprobs is None
-                and rewritten.candidates is None
-            ):
-                continue
 
             if rewritten.done:
                 terminal_outcome_selected = True
@@ -968,6 +957,7 @@ class GenerationAdapter(ModelAdapter):
         logprobs: bool = False,
         top_logprobs: int | None = None,
         images: list[ImageInput] | None = None,
+        videos: list[VideoInput] | None = None,
     ) -> AsyncIterator[GenerationChunk]:
         """Stream generation chunks from a prompt.
 
@@ -1011,6 +1001,9 @@ class GenerationAdapter(ModelAdapter):
                 adapter forwards the image bytes to the engine. ``None``
                 or empty for text-only generation. Text-only adapters may
                 ignore this argument.
+            videos: Optional list of wire-format :class:`VideoInput` clips,
+                each matching one video placeholder the chat template
+                rendered. Only adapters for ``inputs.video`` models accept it.
 
         Yields:
             :class:`GenerationChunk` instances. At least one terminal

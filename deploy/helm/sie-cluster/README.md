@@ -19,11 +19,13 @@ render with an explicit non-secret payload-store choice:
 mise run helm -- dependencies
 mise run helm -- lint --set payloadStore.enabled=false
 mise run helm -- template --set payloadStore.enabled=false
+mise exec -- uv run --frozen --project . pytest -q tools/ci/tests/test_helm_render.py
 ```
 
 The task temporarily stages the public model and bundle YAML files into the
 chart and removes them after each render. Helm's generated `charts/` directory
-is ignored and must not be committed.
+is ignored and must not be committed. The render tests need that directory, so
+run them after `dependencies`.
 
 ## Architecture
 
@@ -385,6 +387,20 @@ Kubernetes operation/hook; it exceeds the longest default 15-minute Job. With
 a custom `pollingInterval` above 30 seconds, also make the timeout exceed the
 KEDA health deadline of `3 * pollingInterval + 240` seconds.
 
+Size `keda-apply`, `keda-cleanup`, and the KEDA ScaledObject/HPA gate with
+`hooks.resources`. The default memory limit is 1Gi. Requests stay at 128Mi.
+
+```yaml
+hooks:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "200m"
+      memory: "1Gi"
+```
+
 ### Scale-from-Zero Trigger
 
 The gateway emits `sie.gateway.pending_demand` over OTLP when requests arrive
@@ -566,8 +582,8 @@ routing and metrics only; GPU pools must use `gpu.count` for real capacity.
 
 This is the Req6 one-child-at-a-time model placement topology. It distributes
 different models from one runtime bundle across the pod's GPU slots. A child can
-own multiple models, but one model is not spread across children, replicated for
-throughput, or tensor/model-parallelized for an oversized model.
+own multiple models, but one model is not spread across children or replicated
+for throughput. A model too large for one GPU needs a device group instead.
 
 Each worker pod serves exactly one runtime bundle. Different bundles render as
 different worker StatefulSets and therefore different worker identities.
@@ -589,6 +605,87 @@ workers:
           minReplicas: 0
           maxReplicas: 3
 ```
+
+### Tensor-Parallel Device Groups
+
+To serve one model across several GPUs, set `gpu.deviceGroup: true` alongside
+`gpu.count`. The pod then runs a single worker child that owns every GPU in the
+pod (`SIE_DEVICES=cuda:0,...,cuda:N-1`) instead of one child per GPU, and the
+model profile declares how many of them it uses:
+
+```yaml
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime:
+        tensor_parallel_size: 4
+        request_read_timeout_s: 600
+        startup_timeout_s: 900
+```
+
+A complete device-group pool follows. Its CPU, memory, and shared-memory sizes
+are placeholders. Size them for the model and the node:
+
+```yaml
+workers:
+  pools:
+    l4-4x-group:
+      enabled: true
+      machineProfile: l4-4x
+      gpuType: nvidia-l4
+      gpu:
+        count: 4
+        product: NVIDIA-L4
+        deviceGroup: true
+      shmSize: 32Gi
+      resources:
+        requests:
+          cpu: "16"
+          memory: "64Gi"
+        limits:
+          cpu: "32"
+          memory: "128Gi"
+      bundles:
+        sglang:
+          minReplicas: 0
+          maxReplicas: 1
+```
+
+- The worker claims a contiguous block of `tensor_parallel_size` devices for
+  the model exclusively, evicting unpinned models to free a block when it has
+  to, and releases the block when the model unloads. Loading a single-GPU model
+  while every device is held evicts the least recently used unpinned group.
+- The SGLang generation and embedding adapters accept a width. The generation
+  adapter also requires `request_read_timeout_s` above width one, because a
+  stalled collective produces no bytes and no error, and its own
+  `startup_timeout_s`, because startup at a width is dominated by per-rank graph
+  compilation and capture, so neither `workers.common.modelReadyTimeoutSec` nor
+  the built-in default describes it. Keep the declared budget within
+  `workers.common.modelReadyTimeoutSec` and below the liveness probe budget.
+- A declared `startup_timeout_s` that is not a finite number of seconds above
+  zero is refused when the model loads rather than replaced by a default.
+- Width and placement are declared only through `tensor_parallel_size`. Engine
+  placement flags in `extra_launch_args` (including abbreviations such as
+  `--tp`) and device-visibility variables in `extra_env` are refused. So are the
+  flags that decide where the engine listens: `--nccl-port`, which has the
+  `loadtime.nccl_port` option instead, and `--host` and `--port`, which the
+  server passes for the engine's own HTTP listener and then talks to. They are
+  not this pod's `--host`/`--port`, which the chart sets on the worker
+  container.
+- `gpu.deviceGroup` requires `gpu.count >= 2`. `SIE_GPU_COUNT` and the cluster
+  health `gpu_count` count serving slots, so a device-group pod reports one
+  slot however many GPUs it holds.
+- Every worker pod mounts `/dev/shm` as an in-memory `emptyDir` whose size limit
+  is the pool's `shmSize`, or `workers.common.shmSize` (default `8Gi`) when the
+  pool sets none. Whatever the worker writes there counts against its container
+  memory limit. A tensor-parallel engine runs one process per GPU, and those
+  processes can exchange data through shared memory, so a device-group pool may
+  need a larger `shmSize`. Raise `resources.limits.memory` with it so the limit
+  covers both the engine processes and their shared memory.
+- Splitting a model across GPUs on a node without a fast GPU interconnect adds
+  communication overhead. For a model that fits one GPU, fan-out children
+  serving replicas usually deliver more throughput for the same GPUs.
 
 ### Queue Pool Patterns
 
@@ -639,6 +736,24 @@ For emergency or legacy static namespaces that are not backed by either
 `queueRouting.poolAdmission.enabled` lets workers pull without the admission
 gate. Prefer declaring static pools instead, so capped/dynamic pools keep their
 fail-closed isolation behavior.
+
+### High availability in one file
+
+`values-ha.yaml` is the tested composition of the durability knobs below with
+a replicated broker and a second gateway: two gateway replicas, a three-member
+NATS cluster with a JetStream file store per member, and file-backed work-queue
+streams replicated across all three. Layer it under a provider overlay:
+
+```bash
+helm install sie deploy/helm/sie-cluster \
+  -f deploy/helm/sie-cluster/values-aws.yaml \
+  -f deploy/helm/sie-cluster/values-ha.yaml
+```
+
+It does not make `sie-config` redundant; that service stays at one replica by
+template design until the chart provides leader election. And because a live
+stream's storage type cannot be changed, apply it to a fresh install or convert
+the streams during a maintenance window as described below.
 
 ### Work-queue durability (memory vs file storage)
 
