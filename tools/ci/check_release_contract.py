@@ -155,6 +155,7 @@ MPL_LICENSE_EXCEPTION_NAMES = frozenset(
 AUDIO_MANYLINUX_IMAGE = (
     "quay.io/pypa/manylinux_2_28_x86_64@sha256:4dc41da7df20400310c80d162a2fe2d2c2f3d9734d8dec20f6b9843711618deb"
 )
+AUDIO_SOURCE_ASSERTION = 'test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$RELEASE_SHA"'
 TRUSTED_WRITE_CONDITION_TERMS = (
     "inputs.publish == true",
     "vars.PUBLIC_RELEASE_PUBLISHING_ENABLED == 'true'",
@@ -646,6 +647,60 @@ def audio_release_contract() -> tuple[str, str, str]:
     return version, filename, url
 
 
+def default_run_shell(block: str, indent: int) -> str | None:
+    """Read defaults.run.shell from block mappings; unsupported forms fail closed."""
+    lines = block.splitlines()
+    for key in ("defaults", "run", "shell"):
+        prefix = f"{' ' * indent}{key}:"
+        found = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+        if not found:
+            return None
+        if len(found) != 1:
+            return ""
+        start = found[0]
+        value = lines[start].removeprefix(prefix).strip()
+        if key == "shell":
+            return value
+        if value:
+            return ""
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if lines[index].strip()
+                and not lines[index].lstrip().startswith("#")
+                and len(lines[index]) - len(lines[index].lstrip()) <= indent
+            ),
+            len(lines),
+        )
+        lines = lines[start + 1 : end]
+        indent += 2
+    return None
+
+
+def audio_checkout_errors(build: str, workflow: str) -> list[str]:
+    """Require the container's exact-source check to trust only its current workspace."""
+    lines = step_lines(build)
+    assertion = exact_commands(lines, (("rev-parse", re.compile(re.escape(AUDIO_SOURCE_ASSERTION))),))
+    shell = default_run_shell(build, JOB_FIELD_INDENT)
+    if shell is None:
+        shell = default_run_shell(workflow, 0)
+    if assertion is not None:
+        start, end = step_bounds(lines, assertion[0][0])
+        active = [line.removeprefix("- ") for line in lines[start:end]]
+        if (
+            shell == "bash"
+            and "set -euo pipefail" in active
+            and job_scalar(build, "if") is None
+            and job_scalar(build, "continue-on-error") is None
+            and not any(line.startswith(("if:", "continue-on-error:", "shell:", "set +")) for line in active)
+            and not refresh_control_flow(lines, assertion)
+            and build.count("safe.directory") == 1
+        ):
+            return []
+    return ["native audio source check must compare the exact SHA with command-scoped workspace Git trust"]
+
+
 def audio_release_errors() -> list[str]:
     errors: list[str] = []
     version, filename, url = audio_release_contract()
@@ -660,6 +715,9 @@ def audio_release_errors() -> list[str]:
     if not isinstance(rust, dict) or rust.get("version") != "1.98.1":
         errors.append("native audio release must use the repository Rust 1.98.1 pin")
     workflow = (ROOT / ".github/workflows/release-audio.yml").read_text()
+    errors.extend(
+        audio_checkout_errors(workflow_job_blocks(".github/workflows/release-audio.yml").get("build", ""), workflow)
+    )
     required = (
         "ref: ${{ inputs.sha }}",
         AUDIO_MANYLINUX_IMAGE,
